@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings or the container fails to start
+# when the repo is cloned on Windows.
+*.sh text eol=lf
+Dockerfile text eol=lf

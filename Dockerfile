@@ -71,7 +71,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD ["/usr/local/bin/healthcheck.sh"]
 
 WORKDIR /data/workspace
-VOLUME ["/data"]
+# No VOLUME instruction: Railway rejects it. Attach a Railway volume at /data instead.
 EXPOSE 4096
 
 # The entrypoint starts as root only to fix ownership of the freshly mounted

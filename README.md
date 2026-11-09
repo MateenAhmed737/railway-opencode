@@ -39,6 +39,8 @@ railway-opencode/
 │   └── openai-adapter/
 │       └── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
 ├── railway.json                # build/deploy settings (see the note on Config as Code below)
+├── examples/
+│   └── pi-models.json          # pi coding agent provider config for the /v1 API
 ├── tests/
 │   ├── smoke-test.sh           # base checks: auth, $PORT, non-root, persistence, shutdown
 │   ├── adapter-test.sh         # OpenAI API checks against a fake model provider
@@ -303,6 +305,32 @@ Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1"
 - Text only: `image_url` and other non-text parts return `400`. OpenAI `tools`/function calling is ignored, because OpenCode uses its own tools. Sampling parameters (`temperature`, `max_tokens`, ...) are ignored.
 - If OpenCode stops to ask for a permission approval, the request waits until `OPENAI_COMPAT_TIMEOUT_SECONDS` and then returns `504`. To avoid that, set permissions in `/data/xdg/config/opencode/opencode.json` (see the [OpenCode permissions docs](https://docs.opencode.ai/docs/config/)).
 - Only `GET /v1/models` and `POST /v1/chat/completions` exist. Other `/v1/*` paths return an OpenAI-style `404`.
+
+### Using it from the pi coding agent
+
+[`examples/pi-models.json`](examples/pi-models.json) is a ready-made custom provider for [pi](https://github.com/earendil-works/pi) (`@earendil-works/pi-coding-agent`), pointing at this server's `/v1` with OpenCode's free models. It was tested with pi 1.5.0: `--list-models`, plain prompts, and file tasks.
+
+1. Copy it to `~/.pi/agent/models.json`, or merge its `providers` entry into your existing file. Change `baseUrl` if your domain differs.
+2. Put your key in the environment. The file reads it with `$OPENCODE_RAILWAY_KEY`:
+   ```bash
+   export OPENCODE_RAILWAY_KEY='your OPENAI_COMPAT_API_KEY or OPENCODE_SERVER_PASSWORD'
+   ```
+3. Check that pi sees the models, then use one:
+   ```bash
+   pi --list-models opencode-railway
+   ```
+   ```bash
+   pi --model opencode-railway/opencode/big-pickle
+   ```
+   Inside pi, `/model` also shows them, and `Ctrl+S` saves one as the default.
+
+**Important: the work happens on the server, not on your machine.** pi offers its tools (read, edit, bash) to the model, but the adapter returns only OpenCode's final answer and never asks pi to run a tool. OpenCode does the work with its own tools, inside the Railway container, in `/data/workspace` or the folder set by `OPENAI_COMPAT_DIRECTORY`. In the test, "create a file in the current directory" created it in `/data/workspace` on the server, and pi's local folder stayed empty. Treat pi here as a chat front end to your remote OpenCode agent. To have pi edit local files itself, it needs a raw model provider (e.g. pi's built-in `opencode` provider with an OpenCode Zen API key, or any other provider), not this adapter.
+
+Other notes:
+- **Keep the model list current.** The free models change over time. Refresh the `models` list from `GET /v1/models`; the `id` must be exactly `opencode/<model>` as listed there.
+- **The `compat` flags match what the adapter handles:** `system` role instead of `developer`, no `store` or `reasoning_effort`, usage reported in streams, and `max_tokens` (which the adapter ignores).
+- **Images aren't supported.** The models are declared text-only, because the adapter rejects images.
+- **Responses are buffered.** They arrive in one piece rather than token by token.
 
 ### Local OpenCode CLI → remote server
 

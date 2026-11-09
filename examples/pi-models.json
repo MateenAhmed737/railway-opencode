@@ -1,0 +1,26 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "opencode-railway": {
+      "name": "OpenCode (Railway)",
+      "baseUrl": "https://railway-opencode-production.up.railway.app/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENCODE_RAILWAY_KEY",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsStore": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": true,
+        "supportsFinishReason": true,
+        "maxTokensField": "max_tokens",
+        "requiresNonNullAssistantContent": true
+      },
+      "models": [
+        { "id": "opencode/big-pickle", "name": "OpenCode Big Pickle (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
+        { "id": "opencode/glm-5.3-flash-free", "name": "GLM 5.3 Flash (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
+        { "id": "opencode/deepseek-v4.1-flash-free", "name": "DeepSeek v4.1 Flash (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
+        { "id": "opencode/mimo-v2.6-flash-free", "name": "MiMo v2.6 Flash (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } }
+      ]
+    }
+  }
+}

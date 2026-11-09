@@ -16,10 +16,105 @@
         "requiresNonNullAssistantContent": true
       },
       "models": [
-        { "id": "opencode/big-pickle", "name": "OpenCode Big Pickle (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
-        { "id": "opencode/glm-5.3-flash-free", "name": "GLM 5.3 Flash (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
-        { "id": "opencode/deepseek-v4.1-flash-free", "name": "DeepSeek v4.1 Flash (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } },
-        { "id": "opencode/mimo-v2.6-flash-free", "name": "MiMo v2.6 Flash (free)", "contextWindow": 128000, "maxTokens": 16384, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } }
+        {
+          "id": "opencode/big-pickle",
+          "name": "Big Pickle",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 160000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/glm-5.3-flash-free",
+          "name": "GLM-5.3-Flash Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 200000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/deepseek-v4.1-flash-free",
+          "name": "DeepSeek V4.1 Flash Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 200000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/mimo-v2.6-flash-free",
+          "name": "MiMo-V2.6-Flash Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 200000,
+          "maxTokens": 32000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/nemotron-3.5-super-vl-free",
+          "name": "Nemotron 3.5 Super VL Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/nemotron-3.5-lightning-free",
+          "name": "Nemotron 3.5 Lightning Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 262144,
+          "maxTokens": 65536,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/inkling-2-small-free",
+          "name": "Inkling 2 Small Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/crouton-alpha-free",
+          "name": "Crouton Alpha Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 1048576,
+          "maxTokens": 270000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/beam-free",
+          "name": "Beam Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/iceman-free",
+          "name": "Iceman Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 262144,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "opencode/flint-40b-free",
+          "name": "Flint 40B Free",
+          "input": ["text"],
+          "reasoning": false,
+          "contextWindow": 262144,
+          "maxTokens": 65536,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
       ]
     }
   }

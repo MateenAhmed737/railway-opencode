@@ -1,36 +1,48 @@
 # OpenCode on Railway
 
-A single-container deployment of [OpenCode](https://opencode.ai) on Railway. One HTTPS domain serves both:
+A single-container deployment of [OpenCode](https://opencode.ai) on Railway. One HTTPS domain serves:
 
 - the **OpenCode web UI** at `https://YOUR-RAILWAY-DOMAIN/`
-- the **OpenCode HTTP API** at the same origin, for example `https://YOUR-RAILWAY-DOMAIN/global/health`
+- the **native OpenCode HTTP API** at the same origin, for example `https://YOUR-RAILWAY-DOMAIN/global/health`
+- an **OpenAI-compatible API** at `https://YOUR-RAILWAY-DOMAIN/v1` (`/v1/models`, `/v1/chat/completions`)
 
-Everything is protected by OpenCode's built-in HTTP Basic authentication. All state (config, provider logins, sessions, workspace, git repos) lives on a Railway volume mounted at `/data`.
+Everything requires authentication. The web UI and native API use OpenCode's built-in HTTP Basic auth. `/v1` accepts the OpenAI-style `Authorization: Bearer <key>`. All state (config, provider logins, sessions, workspace, git repos) lives on a Railway volume mounted at `/data`.
 
 ```
-Browser / opencode CLI ──HTTPS──▶ Railway edge (TLS) ──HTTP $PORT──▶ container
-                                                                     tini (PID 1)
-                                                                      └─ opencode web --hostname 0.0.0.0 --port $PORT
-                                                                         (user: opencode, uid 10001)
-                                                                     /data  ◀── Railway volume
+Browser / opencode CLI / OpenAI SDK
+        │ HTTPS
+        ▼
+Railway edge (TLS) ──HTTP $PORT──▶ container
+                                   tini (PID 1)
+                                    └─ node /opt/openai-adapter/server.js   0.0.0.0:$PORT  (user: opencode)
+                                        ├─ /v1/*  → OpenAI-compatible adapter
+                                        ├─ else   → proxied unchanged (UI, API, SSE, websockets)
+                                        └─ opencode web                      127.0.0.1:4097 (user: opencode)
+                                   /data  ◀── Railway volume
 ```
 
 Verified against OpenCode **1.19.5** (`opencode-ai` on npm). The flags used here come from `opencode web --help` in that version and from the [server docs](https://docs.opencode.ai/docs/server/).
+
+If you don't want the OpenAI API, set `OPENAI_COMPAT_ENABLED=false`. OpenCode then binds `0.0.0.0:$PORT` directly, with no adapter process in front.
 
 ## Files
 
 ```
 railway-opencode/
-├── Dockerfile              # node:22-bookworm-slim + opencode-ai + minimal tools
+├── Dockerfile                  # node:22-bookworm-slim + opencode-ai + minimal tools
 ├── .dockerignore
-├── .gitattributes          # keeps *.sh as LF (Windows clones would break otherwise)
+├── .gitattributes              # keeps *.sh as LF (Windows clones would break otherwise)
 ├── .gitignore
 ├── docker/
-│   ├── entrypoint.sh       # password guard, /data setup, drop to non-root, exec opencode
-│   └── healthcheck.sh      # authenticated probe for Docker HEALTHCHECK
-├── railway.json            # build/deploy settings (see the note on Config as Code below)
+│   ├── entrypoint.sh           # password guard, /data setup, drop to non-root, start adapter or opencode
+│   ├── healthcheck.sh          # authenticated probe for Docker HEALTHCHECK
+│   └── openai-adapter/
+│       └── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
+├── railway.json                # build/deploy settings (see the note on Config as Code below)
 ├── tests/
-│   └── smoke-test.sh       # local end-to-end validation
+│   ├── smoke-test.sh           # base checks: auth, $PORT, non-root, persistence, shutdown
+│   ├── adapter-test.sh         # OpenAI API checks against a fake model provider
+│   └── fake-llm.js             # tiny OpenAI-style model server used by adapter-test.sh
 └── README.md
 ```
 
@@ -40,14 +52,14 @@ railway-opencode/
   1. exits with an error if `OPENCODE_SERVER_PASSWORD` is empty, so the server never starts without auth;
   2. validates `$PORT` (defaults to `4096` if Railway doesn't set it);
   3. creates the `/data` directories and fixes ownership **only on those directories themselves, and only if wrong**. It never runs `chown -R`. Railway mounts volumes as root, so this step is needed on the first boot;
-  4. drops to the `opencode` user with `gosu` and `exec`s `opencode web --hostname 0.0.0.0 --port $PORT`.
-- **Shutdown.** Railway sends SIGTERM. tini forwards it to OpenCode, which exits right away (tested: exit code 143, under 1 s, no SIGKILL).
-- **Same origin.** `opencode web` is one server on one port. It serves the bundled web UI and the full HTTP API (`/global/health`, `/session`, `/doc`, ...).
+  4. drops to the `opencode` user with `gosu` and starts the adapter. The adapter launches `opencode web --hostname 127.0.0.1 --port 4097`, waits until OpenCode reports healthy, and only then opens the public `$PORT`.
+- **Shutdown.** Railway sends SIGTERM. The adapter stops accepting connections and forwards SIGTERM to OpenCode, which normally exits within a second. If OpenCode is still running after `OPENCODE_SHUTDOWN_GRACE_SECONDS` (default 8), the adapter force-stops it. OpenCode's SQLite store is crash-safe. Either way the container exits with code 143.
+- **Same origin.** Everything is on one port and one domain. OpenCode itself is reachable only on `127.0.0.1` inside the container.
 - **No secrets in the image.** The password and provider credentials are supplied only at runtime.
 
 ### What's in the image
 
-The image is kept small (about 1.1 GB, mostly the Node base and OpenCode). It contains only what the server and a typical git workflow need: `tini`, `gosu`, `bash`, `ca-certificates`, `curl`, `git`, `openssh-client`, `ripgrep`, `less`, `procps`, plus Node.js/npm from the base image.
+The image is about 1.1 GB, mostly the Node base and OpenCode. It contains only what the server and a typical git workflow need: `tini`, `gosu`, `bash`, `ca-certificates`, `curl`, `git`, `openssh-client`, `ripgrep`, `less`, `procps`, plus Node.js/npm from the base image (which the adapter also uses).
 
 **There is no Python and no C compiler.** If the agent will work on Python projects, or on dependencies that compile native code (`node-gyp`, pip packages with C extensions), add the packages to the `apt-get install` list in the `Dockerfile` and redeploy, for example:
 
@@ -87,13 +99,19 @@ docker run --rm -it --name opencode \
 
 Then open http://localhost:4096 and sign in as user `opencode` with the password you set. To see the generated password, set it in a shell variable first instead of inlining `openssl`.
 
-Run the full validation suite. It covers install, password guard, `$PORT`, `0.0.0.0`, non-root, auth on every endpoint, health, writable dirs, graceful shutdown and persistence across restarts:
+Test suites. Both need Docker. On Windows Git Bash, prefix them with `MSYS_NO_PATHCONV=1`.
 
 ```bash
 ./tests/smoke-test.sh
 ```
 
-On Windows Git Bash, prefix it with `MSYS_NO_PATHCONV=1` so `/data/...` paths aren't rewritten.
+That runs 18 checks: install, password guard, `$PORT`, `0.0.0.0`, non-root, auth on every endpoint, health, writable dirs, graceful shutdown, and persistence across restarts.
+
+```bash
+./tests/adapter-test.sh
+```
+
+That runs 28 checks: `/v1` auth, models, chat, streaming, error handling, timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
 
 ## 2. GitHub repository setup
 
@@ -126,7 +144,7 @@ Without the `gh` CLI: create an empty **private** repo on github.com, then run `
 | Healthcheck path | **leave empty** (see below) |
 | Serverless / app sleeping | Off (sleeping would drop live sessions) |
 
-**Why no Railway healthcheck path.** In OpenCode 1.19.5, Basic auth covers **every** route, `/global/health` included (tested: `401` without credentials). Railway's healthcheck sends no credentials and treats only `2xx` as healthy, so `healthcheckPath: /global/health` would fail every deploy. Making the endpoint public would need a reverse proxy, which this design avoids on purpose. Railway only runs healthchecks at deploy time anyway. The image keeps an **authenticated** Docker `HEALTHCHECK`, useful locally and on other hosts, and you can check health yourself with the curl in section 9.
+**Why no Railway healthcheck path.** In OpenCode 1.19.5, Basic auth covers **every** route, `/global/health` included (tested: `401` without credentials). Railway's healthcheck sends no credentials and treats only `2xx` as healthy, so `healthcheckPath: /global/health` would fail every deploy. This project deliberately exposes no unauthenticated route. Railway only runs healthchecks at deploy time anyway. The image keeps an **authenticated** Docker `HEALTHCHECK`, useful locally and on other hosts.
 
 ## 4. Environment variables
 
@@ -136,9 +154,15 @@ Set these in **Service → Variables**:
 |---|---|---|
 | `OPENCODE_SERVER_PASSWORD` | **yes** | Long random secret, e.g. `openssl rand -base64 32`. The container won't start without it |
 | `OPENCODE_SERVER_USERNAME` | no | Defaults to `opencode` |
+| `OPENAI_COMPAT_API_KEY` | no | Separate Bearer key for `/v1`. Defaults to `OPENCODE_SERVER_PASSWORD`. Set it to give API clients a key that can't log in to the web UI |
+| `OPENAI_COMPAT_ENABLED` | no | `true` (default). `false` removes the adapter and OpenCode listens on `$PORT` directly |
+| `OPENAI_COMPAT_AGENT` | no | OpenCode agent for `/v1` requests (e.g. `build`, `plan`). Empty = OpenCode's default |
+| `OPENAI_COMPAT_DIRECTORY` | no | Project directory for `/v1` requests. Default `/data/workspace` |
+| `OPENAI_COMPAT_TIMEOUT_SECONDS` | no | Max time per `/v1` request. Default `600` |
+| `OPENAI_COMPAT_KEEP_SESSIONS` | no | `true` keeps each `/v1` request's session visible in the web UI. Default: they're deleted afterwards |
 | `PORT` | no | Railway injects this automatically. Don't set it unless you use a fixed target port |
 
-Already set in the image (override only if you know why): `HOME=/data/home`, `XDG_DATA_HOME=/data/xdg/data`, `XDG_CONFIG_HOME=/data/xdg/config`, `XDG_STATE_HOME=/data/xdg/state`, `XDG_CACHE_HOME=/data/xdg/cache`, `OPENCODE_DISABLE_AUTOUPDATE=true`.
+Already set in the image (override only if you know why): `HOME=/data/home`, `XDG_*` under `/data/xdg`, `OPENCODE_DISABLE_AUTOUPDATE=true`, `OPENCODE_INTERNAL_PORT=4097`, `OPENCODE_SHUTDOWN_GRACE_SECONDS=8` (implicit default), `OPENCODE_STARTUP_TIMEOUT_SECONDS=180` (implicit default).
 
 Don't set `RAILWAY_RUN_UID`. The image starts as root only to prepare the volume, and then drops privileges itself.
 
@@ -154,6 +178,7 @@ Facts from the Railway docs worth knowing:
 - One volume per service. Volumes are mounted at runtime, not during build.
 - Redeploying a service with a volume has **a short downtime**. Railway won't run two deployments on one volume.
 - Size limits depend on plan (Hobby 5 GB, Pro 50 GB). You can grow a volume but not shrink it.
+- The Dockerfile deliberately has **no `VOLUME` instruction**. Railway's Dockerfile validation rejects it.
 
 ## 6. HTTPS domain
 
@@ -161,7 +186,7 @@ Facts from the Railway docs worth knowing:
 
 For a custom domain, add the `CNAME` and `TXT` records Railway shows ("both are required").
 
-The browser UI and the API share this one domain. There is nothing else to expose.
+The browser UI, the native API and the OpenAI API all share this one domain. There is nothing else to expose.
 
 ## 7. Provider login (persistent)
 
@@ -217,6 +242,8 @@ Clone projects into `/data/workspace`, either from the OpenCode terminal/tools o
 
 ## 9. API access
 
+### Native OpenCode API
+
 Every endpoint needs Basic auth.
 
 ```bash
@@ -232,10 +259,50 @@ Useful endpoints (from the [server docs](https://docs.opencode.ai/docs/server/))
 | `GET /global/health` | Health and version |
 | `GET /doc` | OpenAPI 3.1 spec |
 | `GET /session`, `POST /session` | List / create sessions |
-| `POST /session/:id/message` | Send a prompt |
+| `POST /session/:id/message` | Send a prompt. Body: `{"parts":[{"type":"text","text":"..."}],"model":{"providerID":"...","modelID":"..."}}` |
 | `GET /event` | SSE event stream |
 | `GET /config/providers` | Configured providers & models |
 | `PUT /auth/:id` | Set provider credentials |
+
+### OpenAI-compatible API
+
+Base URL `https://YOUR-RAILWAY-DOMAIN/v1`. The API key is `OPENAI_COMPAT_API_KEY`, or `OPENCODE_SERVER_PASSWORD` if that isn't set. Basic auth also works.
+
+Model IDs are `providerID/modelID`, exactly as `GET /v1/models` lists them (for example `anthropic/claude-sonnet-4-5`). Omit `model`, or use `"default"`, to get OpenCode's default model.
+
+```bash
+curl https://YOUR-RAILWAY-DOMAIN/v1/models \
+  -H "Authorization: Bearer $OPENCODE_SERVER_PASSWORD"
+```
+
+```bash
+curl https://YOUR-RAILWAY-DOMAIN/v1/chat/completions \
+  -H "Authorization: Bearer $OPENCODE_SERVER_PASSWORD" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"anthropic/claude-sonnet-4-5","messages":[{"role":"user","content":"List the files in my-repo"}]}'
+```
+
+Python (`openai` package):
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://YOUR-RAILWAY-DOMAIN/v1", api_key="YOUR_KEY")
+r = client.chat.completions.create(model="anthropic/claude-sonnet-4-5",
+                                   messages=[{"role": "user", "content": "Hello"}])
+print(r.choices[0].message.content)
+```
+
+Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1", apiKey: "YOUR_KEY" })`. This was tested with the official `openai` npm SDK v4: model listing, chat, streaming, and a 401 `AuthenticationError` on a bad key.
+
+**How a request is handled, and what that means for you:**
+
+- Each request creates a new OpenCode session, sends one prompt, returns the final answer text, and then deletes the session. Set `OPENAI_COMPAT_KEEP_SESSIONS=true` to keep sessions so you can inspect them in the web UI. The session ID is returned in the `x-opencode-session` response header.
+- **It's the agent, not a bare model.** OpenCode may read files, run commands and edit code in the project directory before it answers. The response contains only the final text. Pick a different project folder per request with the header `x-opencode-directory: /data/workspace/my-repo`, and a different agent with `x-opencode-agent: plan`.
+- `system`/`developer` messages become OpenCode's system prompt. Earlier user/assistant turns are flattened into a transcript inside the new prompt, because OpenCode sessions can't be pre-filled with assistant turns.
+- **Streaming is buffered.** With `"stream": true` you get a valid SSE response (role chunk, keep-alive comments every 15 s, then the full answer, then `[DONE]`), but the text arrives in one chunk when OpenCode finishes, not token by token. `stream_options.include_usage` is supported.
+- Text only: `image_url` and other non-text parts return `400`. OpenAI `tools`/function calling is ignored, because OpenCode uses its own tools. Sampling parameters (`temperature`, `max_tokens`, ...) are ignored.
+- If OpenCode stops to ask for a permission approval, the request waits until `OPENAI_COMPAT_TIMEOUT_SECONDS` and then returns `504`. To avoid that, set permissions in `/data/xdg/config/opencode/opencode.json` (see the [OpenCode permissions docs](https://docs.opencode.ai/docs/config/)).
+- Only `GET /v1/models` and `POST /v1/chat/completions` exist. Other `/v1/*` paths return an OpenAI-style `404`.
 
 ### Local OpenCode CLI → remote server
 
@@ -261,9 +328,14 @@ Both commands accept `-p/--password` (defaults to `OPENCODE_SERVER_PASSWORD`) an
 
 | Symptom | Fix |
 |---|---|
+| Build fails: "The Dockerfile failed validation" | Make sure the Dockerfile has no `VOLUME` line. Railway rejects it. Fixed in this repo |
 | Deploy crashes with `OPENCODE_SERVER_PASSWORD is not set` | Add the variable (section 4) and redeploy |
 | Deploy never becomes healthy | Clear the Healthcheck Path in settings. `/global/health` requires auth |
-| "Application failed to respond" | Don't hardcode `PORT`. If you set a target port on the domain, it must match `$PORT` |
+| "Application failed to respond" right after deploy | OpenCode is still starting. The public port opens once it's healthy (usually a few seconds). If it persists: don't hardcode `PORT`, and any target port on the domain must match `$PORT` |
+| `/v1/...` returns `401 invalid_api_key` | Use `Authorization: Bearer <OPENAI_COMPAT_API_KEY or OPENCODE_SERVER_PASSWORD>` |
+| `/v1/chat/completions` returns `504` | OpenCode took longer than `OPENAI_COMPAT_TIMEOUT_SECONDS`, often because it's waiting for a permission approval. Raise the timeout or configure permissions |
+| `/v1/chat/completions` returns `401 ProviderAuthError` | The chosen provider isn't logged in. See section 7 |
+| `/v1/...` returns HTML | `OPENAI_COMPAT_ENABLED` is `false`, so OpenCode serves its web UI for unknown paths |
 | `PermissionDenied ... /data/xdg/...` | Something wrote files as root (usually `opencode` run in `railway ssh` without `gosu`). Fix once: `chown -R opencode:opencode /data/xdg /data/home` |
 | `fatal: detected dubious ownership` in git | You're running git as root. Use `gosu opencode git ...` or `gosu opencode bash` |
 | `/usr/bin/env: 'bash\r'` at start | CRLF line endings. `.gitattributes` prevents it. Re-clone, or run `git add --renormalize .` |
@@ -272,7 +344,7 @@ Both commands accept `-p/--password` (defaults to `OPENCODE_SERVER_PASSWORD`) an
 
 ### Upgrading OpenCode
 
-Change `ARG OPENCODE_VERSION` in the `Dockerfile`, run `./tests/smoke-test.sh`, then push. Railway redeploys from GitHub. Data on `/data` is kept.
+Change `ARG OPENCODE_VERSION` in the `Dockerfile`, run both test suites, then push. Railway redeploys from GitHub. Data on `/data` is kept.
 
 ### Backups
 
@@ -281,7 +353,8 @@ Change `ARG OPENCODE_VERSION` in the `Dockerfile`, run `./tests/smoke-test.sh`, 
 
 ## Security notes
 
-- OpenCode runs as uid 10001. Root is used only for the entrypoint's directory setup.
-- No credentials are in the image or the repo. The password is never logged (the smoke test checks this).
-- No unauthenticated route is exposed. TLS is terminated by Railway's edge.
-- Anyone with the password can run shell commands in the container through OpenCode. Treat it like an SSH key: use a long random value, and rotate it by changing the variable and redeploying.
+- The adapter and OpenCode run as uid 10001. Root is used only for the entrypoint's directory setup.
+- OpenCode listens on `127.0.0.1` only. Every public request passes through the adapter, and every route needs credentials: `/v1/*` checks the Bearer key (constant-time compare), and everything else is checked by OpenCode's own Basic auth.
+- No credentials are in the image or the repo. The password is never logged (both test suites check this).
+- TLS is terminated by Railway's edge.
+- Anyone with the password **or the `/v1` key** can make OpenCode run shell commands in the container. Treat both like SSH keys: use long random values, give API clients a separate `OPENAI_COMPAT_API_KEY`, and rotate by changing the variable and redeploying.

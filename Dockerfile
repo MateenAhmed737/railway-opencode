@@ -55,6 +55,8 @@ ENV DATA_DIR=/data \
     APP_USER=opencode \
     OPENCODE_SERVER_USERNAME=opencode \
     OPENCODE_DISABLE_AUTOUPDATE=true \
+    OPENAI_COMPAT_ENABLED=true \
+    OPENCODE_INTERNAL_PORT=4097 \
     PORT=4096
 
 # Pre-create the tree so local runs without a volume also work.
@@ -64,6 +66,8 @@ RUN mkdir -p /data/home /data/workspace \
 
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=0755 docker/healthcheck.sh /usr/local/bin/healthcheck.sh
+# OpenAI-compatible adapter + proxy (plain Node, no dependencies).
+COPY docker/openai-adapter/ /opt/openai-adapter/
 
 # Local Docker health status. OpenCode protects /global/health with Basic auth,
 # so the probe authenticates. (Railway ignores Docker HEALTHCHECK; see README.)

@@ -83,6 +83,18 @@ log "  workspace  : ${WORKSPACE_DIR}"
 log "  data/config: ${XDG_DATA_HOME} / ${XDG_CONFIG_HOME}"
 log "  run as     : ${APP_USER}"
 
+OPENAI_COMPAT_ENABLED="${OPENAI_COMPAT_ENABLED:-true}"
+if [[ "${OPENAI_COMPAT_ENABLED,,}" =~ ^(1|true|yes)$ ]]; then
+  INTERNAL_PORT="${OPENCODE_INTERNAL_PORT:-4097}"
+  [[ "${INTERNAL_PORT}" == "${PORT}" ]] && INTERNAL_PORT=$(( PORT + 1 ))
+  export OPENCODE_INTERNAL_PORT="${INTERNAL_PORT}"
+  log "  openai api : /v1/models, /v1/chat/completions (Bearer key = $([[ -n "${OPENAI_COMPAT_API_KEY:-}" ]] && echo OPENAI_COMPAT_API_KEY || echo OPENCODE_SERVER_PASSWORD))"
+  log "  opencode   : 127.0.0.1:${INTERNAL_PORT} (internal, behind the adapter)"
+  # The adapter owns the public port, supervises OpenCode and forwards signals.
+  exec "${RUN_AS[@]}" node /opt/openai-adapter/server.js "$@"
+fi
+
+# Adapter disabled: OpenCode owns the public port directly.
 # exec so tini's signals (SIGTERM from Railway) reach OpenCode directly.
 exec "${RUN_AS[@]}" opencode web \
   --hostname "${HOSTNAME_BIND}" \

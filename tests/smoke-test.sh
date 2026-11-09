@@ -14,7 +14,7 @@ fails=0
 pass() { printf '  PASS  %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 check() { local desc="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$desc"; else fail "$desc"; fi; }
-code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+code() { curl -s -m 10 -o /dev/null -w '%{http_code}' "$@"; }
 wait_up() { for _ in $(seq 1 60); do [[ "$(code -u "opencode:${PASS}" "${BASE}/global/health")" == 200 ]] && return 0; sleep 1; done; return 1; }
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1; docker volume rm -f "$VOL" >/dev/null 2>&1; }

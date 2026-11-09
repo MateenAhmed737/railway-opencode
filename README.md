@@ -113,7 +113,7 @@ That runs 18 checks: install, password guard, `$PORT`, `0.0.0.0`, non-root, auth
 ./tests/adapter-test.sh
 ```
 
-That runs 34 checks: `/v1` auth, models, chat, streaming, images (data URLs, downloaded URLs, multiple images, rejected types), error handling, timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
+That runs 38 checks: `/v1` auth, models, chat, streaming, images (data URLs, downloaded URLs, multiple images, rejected types), error handling, provider rate limits (fast 429), timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
 
 ## 2. GitHub repository setup
 
@@ -162,6 +162,7 @@ Set these in **Service → Variables**:
 | `OPENAI_COMPAT_DIRECTORY` | no | Project directory for `/v1` requests. Default `/data/workspace` |
 | `OPENAI_COMPAT_TIMEOUT_SECONDS` | no | Max time per `/v1` request. Default `600` |
 | `OPENAI_COMPAT_KEEP_SESSIONS` | no | `true` keeps each `/v1` request's session visible in the web UI. Default: they're deleted afterwards |
+| `OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS` | no | If OpenCode schedules a provider retry further out than this, or hits the free-tier limit, `/v1` returns `429` right away instead of waiting. Default `30` |
 | `OPENAI_COMPAT_MAX_BODY_MB` | no | Max `/v1` request size, including base64 images. Default `25` |
 | `OPENAI_COMPAT_MAX_IMAGE_MB` | no | Max size of an image the adapter downloads from an `http(s)` URL. Default `10` |
 | `PORT` | no | Railway injects this automatically. Don't set it unless you use a fixed target port |
@@ -368,6 +369,7 @@ Both commands accept `-p/--password` (defaults to `OPENCODE_SERVER_PASSWORD`) an
 | Deploy never becomes healthy | Clear the Healthcheck Path in settings. `/global/health` requires auth |
 | "Application failed to respond" right after deploy | OpenCode is still starting. The public port opens once it's healthy (usually a few seconds). If it persists: don't hardcode `PORT`, and any target port on the domain must match `$PORT` |
 | `/v1/...` returns `401 invalid_api_key` | Use `Authorization: Bearer <OPENAI_COMPAT_API_KEY or OPENCODE_SERVER_PASSWORD>` |
+| `/v1/chat/completions` returns `429` "Free usage exceeded" | OpenCode's free models have a usage limit, and Railway apps share outgoing IPs, so you can hit it quickly. The error includes `Retry-After` and when OpenCode would retry. Options: wait for the reset, subscribe to OpenCode Go, or log in a provider of your own (section 7) and use its models. Without this check, OpenCode silently waits for the reset (seen: about 22 hours) and the request just hangs |
 | `/v1/chat/completions` returns `504` | OpenCode took longer than `OPENAI_COMPAT_TIMEOUT_SECONDS`, often because it's waiting for a permission approval. Raise the timeout or configure permissions |
 | `/v1/chat/completions` returns `401 ProviderAuthError` | The chosen provider isn't logged in. See section 7 |
 | `/v1/...` returns HTML | `OPENAI_COMPAT_ENABLED` is `false`, so OpenCode serves its web UI for unknown paths |

@@ -28,6 +28,8 @@ const DEFAULT_DIR = env.OPENAI_COMPAT_DIRECTORY || env.WORKSPACE_DIR || '/data/w
 const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || '';
 const KEEP_SESSIONS = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_KEEP_SESSIONS || '');
 const TIMEOUT_MS = int(env.OPENAI_COMPAT_TIMEOUT_SECONDS, 600) * 1000;
+// If OpenCode schedules a provider retry further out than this, fail fast with 429.
+const MAX_RETRY_WAIT_MS = int(env.OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS, 30) * 1000;
 const MAX_BODY = int(env.OPENAI_COMPAT_MAX_BODY_MB, 25) * 1024 * 1024;
 const MAX_REMOTE_FILE = int(env.OPENAI_COMPAT_MAX_IMAGE_MB, 10) * 1024 * 1024;
 const FILE_MIME = /^(image\/(png|jpe?g|gif|webp)|application\/pdf)$/i;
@@ -125,6 +127,42 @@ function oc(method, path, body, signal) {
     if (data) req.write(data);
     req.end();
   });
+}
+
+/**
+ * Follow OpenCode's event stream for one session. OpenCode reports provider
+ * rate limits as `session.status {type:"retry"}` and keeps waiting (for the
+ * free tier, until the quota resets, which can be many hours). Returns a
+ * function that stops watching.
+ */
+function watchSession(sessionID, dir, onEvent) {
+  const req = http.request(
+    { host: '127.0.0.1', port: UP_PORT, method: 'GET', path: withDir('/event', dir), headers: { authorization: UP_AUTH, accept: 'text/event-stream' } },
+    (res) => {
+      res.setEncoding('utf8');
+      let buf = '';
+      res.on('data', (chunk) => {
+        buf += chunk;
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          for (const line of frame.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            try {
+              const ev = JSON.parse(line.slice(5).trim());
+              const p = ev.properties || {};
+              if ((p.sessionID || (p.info && p.info.sessionID) || (p.part && p.part.sessionID)) === sessionID) onEvent(ev);
+            } catch {}
+          }
+        }
+      });
+      res.on('error', () => {});
+    },
+  );
+  req.on('error', () => {});
+  req.end();
+  return () => req.destroy();
 }
 
 const withDir = (path, dir) => `${path}${path.includes('?') ? '&' : '?'}directory=${encodeURIComponent(dir)}`;
@@ -325,8 +363,26 @@ async function chatCompletions(req, res) {
     keepalive = setInterval(() => res.write(': keepalive\n\n'), 15000);
   }
 
+  // Fail fast instead of hanging when the provider is rate-limiting us.
+  let rateLimited = null;
+  const stopWatching = watchSession(sessionID, dir, (ev) => {
+    if (ev.type !== 'session.status' || !ev.properties.status || ev.properties.status.type !== 'retry') return;
+    const st = ev.properties.status;
+    const waitMs = typeof st.next === 'number' ? st.next - Date.now() : 0;
+    const freeLimit = st.action && st.action.reason === 'free_tier_limit';
+    if (!freeLimit && waitMs <= MAX_RETRY_WAIT_MS) return; // short backoff: let OpenCode retry
+    const extra = st.action && st.action.message ? ` ${st.action.message}` : '';
+    rateLimited = {
+      message: `${st.message || 'Provider rate limit'}.${extra}`.replace(/\.\./g, '.'),
+      retryAfter: Math.max(1, Math.round(waitMs / 1000)),
+      reason: (st.action && st.action.reason) || 'retry',
+    };
+    ac.abort();
+  });
+
   const cleanup = () => {
     clearTimeout(timer);
+    stopWatching();
     if (keepalive) clearInterval(keepalive);
     if (!KEEP_SESSIONS) oc('DELETE', withDir(`/session/${sessionID}`, dir)).catch(() => {});
   };
@@ -349,6 +405,14 @@ async function chatCompletions(req, res) {
     await oc('POST', withDir(`/session/${sessionID}/abort`, dir)).catch(() => {});
     cleanup();
     if (clientGone) return log(`chat ${sessionID} cancelled by client`);
+    if (rateLimited) {
+      const when = new Date(Date.now() + rateLimited.retryAfter * 1000).toISOString();
+      const msg = `${rateLimited.message} (OpenCode would retry at ${when})`;
+      log(`chat ${sessionID} rate limited: ${rateLimited.reason}, retry in ${rateLimited.retryAfter}s`);
+      if (stream) { res.write(`data: ${JSON.stringify({ error: { message: msg, type: 'rate_limit_error', code: rateLimited.reason } })}\n\ndata: [DONE]\n\n`); return res.end(); }
+      res.setHeader('retry-after', String(rateLimited.retryAfter));
+      return oaiError(res, 429, msg, 'rate_limit_error', rateLimited.reason);
+    }
     const msg = timedOut ? `OpenCode did not finish within ${TIMEOUT_MS / 1000}s (it may be waiting for a permission approval)` : `OpenCode request failed: ${e.message}`;
     log(`chat ${sessionID} failed: ${msg}`);
     if (stream) { res.write(`data: ${JSON.stringify({ error: { message: msg, type: 'api_error' } })}\n\ndata: [DONE]\n\n`); return res.end(); }

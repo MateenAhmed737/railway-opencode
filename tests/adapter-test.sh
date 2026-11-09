@@ -66,6 +66,12 @@ echo "== errors"
 expect "bad model id -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"echo","messages":[{"role":"user","content":"x"}]}')"
 expect "invalid JSON -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{')"
 expect "unknown /v1 route -> 404 JSON" 'unknown_url' "$(curl -s -H "Authorization: Bearer ${KEY}" "${BASE}/v1/embeddings")"
+START=$(date +%s)
+RL="$(curl -s -m 60 -i -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"fake/echo","messages":[{"role":"user","content":"LIMIT me"}]}')"
+expect "provider rate limit -> 429 fast" '429' "$(echo "$RL" | head -1)"
+expect "429 carries Retry-After" 'retry-after:' "$(echo "$RL" | tr 'A-Z' 'a-z')"
+expect "429 is OpenAI rate_limit_error" 'rate_limit_error' "$RL"
+(( $(date +%s) - START < 20 )) && pass "rate limit reported in $(( $(date +%s) - START ))s (not hung)" || fail "rate limit took $(( $(date +%s) - START ))s"
 expect "timeout -> 504" 504 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":"SLOW please"}]}')"
 
 echo "== cleanup + passthrough"

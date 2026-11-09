@@ -44,6 +44,11 @@ http
       const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
       const sys = msgs.some((m) => m.role === 'system' && text(m).includes('ADAPTER-SYSTEM-MARKER')) ? 'yes' : 'no';
       const reply = `FAKE-REPLY[sys=${sys}][img=${images(lastUser)}]: ${lastUser ? text(lastUser).slice(-200) : ''}`;
+      // "LIMIT" simulates a provider quota: 429 with a one-hour Retry-After.
+      if (reply.includes('LIMIT')) {
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3600' });
+        return res.end(JSON.stringify({ error: { message: 'Fake quota exceeded', type: 'rate_limit_error' } }));
+      }
       setTimeout(() => respond(res, body, reply), reply.includes('SLOW') ? 8000 : 0);
     });
   })

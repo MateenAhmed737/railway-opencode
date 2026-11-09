@@ -28,7 +28,9 @@ const DEFAULT_DIR = env.OPENAI_COMPAT_DIRECTORY || env.WORKSPACE_DIR || '/data/w
 const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || '';
 const KEEP_SESSIONS = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_KEEP_SESSIONS || '');
 const TIMEOUT_MS = int(env.OPENAI_COMPAT_TIMEOUT_SECONDS, 600) * 1000;
-const MAX_BODY = 10 * 1024 * 1024;
+const MAX_BODY = int(env.OPENAI_COMPAT_MAX_BODY_MB, 25) * 1024 * 1024;
+const MAX_REMOTE_FILE = int(env.OPENAI_COMPAT_MAX_IMAGE_MB, 10) * 1024 * 1024;
+const FILE_MIME = /^(image\/(png|jpe?g|gif|webp)|application\/pdf)$/i;
 const UP_AUTH = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
 
 if (!PASS) {
@@ -127,31 +129,95 @@ function oc(method, path, body, signal) {
 
 const withDir = (path, dir) => `${path}${path.includes('?') ? '&' : '?'}directory=${encodeURIComponent(dir)}`;
 
-function contentToText(content) {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((p) => {
-        if (typeof p === 'string') return p;
-        if (p && (p.type === 'text' || p.type === 'input_text')) return p.text || '';
-        throw Object.assign(new Error(`Unsupported content part type '${p && p.type}'. Only text is supported.`), { status: 400 });
-      })
-      .join('');
+const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
+
+/**
+ * OpenAI message content -> { text, files }.
+ * Supports text parts, image parts (`image_url` as object or string, `input_image`)
+ * and `file` parts carrying a data: URL (e.g. PDFs). Files are references only;
+ * remote URLs are downloaded later by resolveFile().
+ */
+function contentToParts(content) {
+  if (content == null) return { text: '', files: [] };
+  if (typeof content === 'string') return { text: content, files: [] };
+  if (!Array.isArray(content)) throw badRequest('Unsupported message content');
+  let text = '';
+  const files = [];
+  for (const p of content) {
+    if (typeof p === 'string') { text += p; continue; }
+    if (!p || typeof p !== 'object') throw badRequest('Invalid content part');
+    if (p.type === 'text' || p.type === 'input_text') { text += p.text || ''; continue; }
+    if (p.type === 'image_url' || p.type === 'input_image') {
+      const url = typeof p.image_url === 'string' ? p.image_url : (p.image_url && p.image_url.url) || p.url;
+      if (!url) throw badRequest('image_url part is missing a url');
+      files.push({ url, kind: 'image' });
+      continue;
+    }
+    if (p.type === 'file' || p.type === 'input_file') {
+      const f = p.file || p;
+      const url = f.file_data || f.url;
+      if (!url) throw badRequest('file part needs file.file_data (a data: URL); file_id is not supported');
+      files.push({ url, kind: 'file', filename: f.filename });
+      continue;
+    }
+    throw badRequest(`Unsupported content part type '${p.type}'. Supported: text, image_url, file.`);
   }
-  throw Object.assign(new Error('Unsupported message content'), { status: 400 });
+  return { text, files };
 }
 
-/** OpenAI messages -> { system, text } for a single OpenCode prompt. */
+function parseDataUrl(url) {
+  const m = /^data:([^;,]+)((?:;[^;,=]+=[^;,]*)*)(;base64)?,/i.exec(url);
+  return m ? { mime: m[1].toLowerCase(), base64: !!m[3] } : null;
+}
+
+/** File reference -> OpenCode FilePartInput ({ type, mime, url, filename }). */
+async function resolveFile(f, index, signal) {
+  const filename = f.filename || `${f.kind}-${index + 1}`;
+  if (/^data:/i.test(f.url)) {
+    const d = parseDataUrl(f.url);
+    if (!d || !d.base64) throw badRequest(`${filename}: data URL must be base64-encoded`);
+    if (!FILE_MIME.test(d.mime)) throw badRequest(`${filename}: unsupported type ${d.mime} (png, jpeg, gif, webp or pdf)`);
+    return { type: 'file', mime: d.mime === 'image/jpg' ? 'image/jpeg' : d.mime, url: f.url, filename };
+  }
+  if (!/^https?:\/\//i.test(f.url)) throw badRequest(`${filename}: url must be a data: URL or http(s) URL`);
+  let r;
+  try {
+    r = await fetch(f.url, { signal, redirect: 'follow' });
+  } catch (e) {
+    throw badRequest(`${filename}: could not download ${f.url} (${e.message})`);
+  }
+  if (!r.ok) throw badRequest(`${filename}: download returned HTTP ${r.status}`);
+  const mime = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!FILE_MIME.test(mime)) throw badRequest(`${filename}: downloaded content type '${mime}' is not an image or pdf`);
+  const len = Number(r.headers.get('content-length') || 0);
+  if (len > MAX_REMOTE_FILE) throw badRequest(`${filename}: larger than ${MAX_REMOTE_FILE >> 20} MB`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > MAX_REMOTE_FILE) throw badRequest(`${filename}: larger than ${MAX_REMOTE_FILE >> 20} MB`);
+  return { type: 'file', mime, url: `data:${mime};base64,${buf.toString('base64')}`, filename };
+}
+
+/** OpenAI messages -> { system, text, files } for a single OpenCode prompt. */
 function buildPrompt(messages) {
   const system = [];
   const turns = [];
+  const files = [];
   for (const m of messages) {
-    if (!m || typeof m !== 'object') throw Object.assign(new Error('Invalid message'), { status: 400 });
-    const text = contentToText(m.content);
-    if (m.role === 'system' || m.role === 'developer') system.push(text);
-    else if (m.role === 'user' || m.role === 'assistant' || m.role === 'tool') turns.push({ role: m.role, text });
-    else throw Object.assign(new Error(`Unsupported role '${m.role}'`), { status: 400 });
+    if (!m || typeof m !== 'object') throw badRequest('Invalid message');
+    const { text: body, files: f } = contentToParts(m.content);
+    let text = body;
+    if (m.role === 'system' || m.role === 'developer') {
+      if (f.length) throw badRequest('Images/files are only supported in user messages');
+      system.push(text);
+      continue;
+    }
+    if (!['user', 'assistant', 'tool'].includes(m.role)) throw badRequest(`Unsupported role '${m.role}'`);
+    if (f.length && m.role !== 'user') throw badRequest('Images/files are only supported in user messages');
+    // Mark where attachments sat in the conversation, then attach them all.
+    for (const file of f) {
+      files.push(file);
+      text += `${text ? ' ' : ''}[attachment ${files.length}]`;
+    }
+    turns.push({ role: m.role, text });
   }
   if (!turns.length || turns[turns.length - 1].role !== 'user') {
     throw Object.assign(new Error('The last non-system message must have role "user"'), { status: 400 });
@@ -164,7 +230,7 @@ function buildPrompt(messages) {
     const history = turns.slice(0, -1).map((t) => `${label[t.role]}: ${t.text}`).join('\n\n');
     text = `Conversation so far:\n\n${history}\n\nUser: ${turns[turns.length - 1].text}`;
   }
-  return { system: system.join('\n\n'), text };
+  return { system: system.join('\n\n'), text, files };
 }
 
 function parseModel(model) {
@@ -209,6 +275,14 @@ async function chatCompletions(req, res) {
   try {
     prompt = buildPrompt(body.messages);
     model = parseModel(body.model);
+  } catch (e) {
+    return oaiError(res, e.status || 400, e.message);
+  }
+
+  // Images/PDFs -> OpenCode file parts (remote URLs downloaded here, before any session exists).
+  let fileParts;
+  try {
+    fileParts = await Promise.all(prompt.files.map((f, i) => resolveFile(f, i, AbortSignal.timeout(60_000))));
   } catch (e) {
     return oaiError(res, e.status || 400, e.message);
   }
@@ -264,7 +338,7 @@ async function chatCompletions(req, res) {
       'POST',
       withDir(`/session/${sessionID}/message`, dir),
       {
-        parts: [{ type: 'text', text: prompt.text }],
+        parts: [{ type: 'text', text: prompt.text }, ...fileParts],
         ...(prompt.system ? { system: prompt.system } : {}),
         ...(model ? { model } : {}),
         ...(agent ? { agent } : {}),

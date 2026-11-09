@@ -6,6 +6,9 @@
 const http = require('node:http');
 
 const text = (m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((p) => p.text || '').join(''));
+const images = (m) => (Array.isArray(m && m.content) ? m.content.filter((p) => p.type === 'image_url').length : 0);
+// 1x1 PNG served at /test.png so the adapter's remote-image download can be tested.
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64');
 
 function respond(res, body, reply) {
   if (res.destroyed) return;
@@ -27,6 +30,10 @@ http
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
+      if (req.url === '/test.png') {
+        res.writeHead(200, { 'content-type': 'image/png' });
+        return res.end(PNG);
+      }
       if (req.url.endsWith('/models')) {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ object: 'list', data: [{ id: 'echo', object: 'model' }] }));
@@ -36,7 +43,7 @@ http
       const msgs = body.messages || [];
       const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
       const sys = msgs.some((m) => m.role === 'system' && text(m).includes('ADAPTER-SYSTEM-MARKER')) ? 'yes' : 'no';
-      const reply = `FAKE-REPLY[sys=${sys}]: ${lastUser ? text(lastUser).slice(-200) : ''}`;
+      const reply = `FAKE-REPLY[sys=${sys}][img=${images(lastUser)}]: ${lastUser ? text(lastUser).slice(-200) : ''}`;
       setTimeout(() => respond(res, body, reply), reply.includes('SLOW') ? 8000 : 0);
     });
   })

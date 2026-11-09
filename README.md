@@ -113,7 +113,7 @@ That runs 18 checks: install, password guard, `$PORT`, `0.0.0.0`, non-root, auth
 ./tests/adapter-test.sh
 ```
 
-That runs 28 checks: `/v1` auth, models, chat, streaming, error handling, timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
+That runs 34 checks: `/v1` auth, models, chat, streaming, images (data URLs, downloaded URLs, multiple images, rejected types), error handling, timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
 
 ## 2. GitHub repository setup
 
@@ -162,6 +162,8 @@ Set these in **Service → Variables**:
 | `OPENAI_COMPAT_DIRECTORY` | no | Project directory for `/v1` requests. Default `/data/workspace` |
 | `OPENAI_COMPAT_TIMEOUT_SECONDS` | no | Max time per `/v1` request. Default `600` |
 | `OPENAI_COMPAT_KEEP_SESSIONS` | no | `true` keeps each `/v1` request's session visible in the web UI. Default: they're deleted afterwards |
+| `OPENAI_COMPAT_MAX_BODY_MB` | no | Max `/v1` request size, including base64 images. Default `25` |
+| `OPENAI_COMPAT_MAX_IMAGE_MB` | no | Max size of an image the adapter downloads from an `http(s)` URL. Default `10` |
 | `PORT` | no | Railway injects this automatically. Don't set it unless you use a fixed target port |
 
 Already set in the image (override only if you know why): `HOME=/data/home`, `XDG_*` under `/data/xdg`, `OPENCODE_DISABLE_AUTOUPDATE=true`, `OPENCODE_INTERNAL_PORT=4097`, `OPENCODE_SHUTDOWN_GRACE_SECONDS=8` (implicit default), `OPENCODE_STARTUP_TIMEOUT_SECONDS=180` (implicit default).
@@ -302,7 +304,12 @@ Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1"
 - **It's the agent, not a bare model.** OpenCode may read files, run commands and edit code in the project directory before it answers. The response contains only the final text. Pick a different project folder per request with the header `x-opencode-directory: /data/workspace/my-repo`, and a different agent with `x-opencode-agent: plan`.
 - `system`/`developer` messages become OpenCode's system prompt. Earlier user/assistant turns are flattened into a transcript inside the new prompt, because OpenCode sessions can't be pre-filled with assistant turns.
 - **Streaming is buffered.** With `"stream": true` you get a valid SSE response (role chunk, keep-alive comments every 15 s, then the full answer, then `[DONE]`), but the text arrives in one chunk when OpenCode finishes, not token by token. `stream_options.include_usage` is supported.
-- Text only: `image_url` and other non-text parts return `400`. OpenAI `tools`/function calling is ignored, because OpenCode uses its own tools. Sampling parameters (`temperature`, `max_tokens`, ...) are ignored.
+- **Images and PDFs are supported** in user messages, using standard OpenAI content parts:
+  - `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. A plain `http(s)` URL also works: the adapter downloads it, up to `OPENAI_COMPAT_MAX_IMAGE_MB`.
+  - `{"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"x.pdf"}}`. `file_id` isn't supported.
+  - Accepted types are PNG, JPEG, GIF, WebP and PDF. Anything else (SVG, audio, `file://` URLs) returns a clear `400`.
+  - Use a model that accepts images. Tested free ones that correctly described a test image: `opencode/nemotron-3.5-super-vl-free`, `opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free`, `opencode/deepseek-v4.1-flash-free` and `opencode/inkling-2-small-free`. `opencode/crouton-alpha-free` is listed as image/PDF-capable but answered "not available in your country" from the test location. Text-only models such as `opencode/big-pickle` reply that they can't see images.
+- OpenAI `tools`/function calling is ignored, because OpenCode uses its own tools. Audio input isn't supported. Sampling parameters (`temperature`, `max_tokens`, ...) are ignored.
 - If OpenCode stops to ask for a permission approval, the request waits until `OPENAI_COMPAT_TIMEOUT_SECONDS` and then returns `504`. To avoid that, set permissions in `/data/xdg/config/opencode/opencode.json` (see the [OpenCode permissions docs](https://docs.opencode.ai/docs/config/)).
 - Only `GET /v1/models` and `POST /v1/chat/completions` exist. Other `/v1/*` paths return an OpenAI-style `404`.
 
@@ -329,7 +336,7 @@ Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1"
 Other notes:
 - **Keep the model list current.** The free models change over time. Refresh the `models` list from `GET /v1/models`; the `id` must be exactly `opencode/<model>` as listed there.
 - **The `compat` flags match what the adapter handles:** `system` role instead of `developer`, no `store` or `reasoning_effort`, usage reported in streams, and `max_tokens` (which the adapter ignores).
-- **Images aren't supported.** The models are declared text-only, because the adapter rejects images.
+- **Images work with the six vision models,** which are declared `"input": ["text", "image"]`. Attach a screenshot with `pi @screenshot.png "what's wrong here?"` or by pasting it in the TUI. This was tested with pi 1.5.0 and `nemotron-3.5-super-vl-free`. The other five models stay text-only, so pi won't send them images.
 - **Responses are buffered.** They arrive in one piece rather than token by token.
 
 ### Local OpenCode CLI → remote server

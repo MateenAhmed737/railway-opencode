@@ -25,7 +25,7 @@ echo "== setup"
 docker build -q -t "$IMAGE" "$(dirname "$0")/.." >/dev/null || { echo "build failed"; exit 1; }
 docker network create "$NET" >/dev/null
 docker run -d --name "$LLM" --network "$NET" -v "$SRC:/fake-llm.js:ro" --entrypoint node "$IMAGE" /fake-llm.js >/dev/null
-CFG="{\"provider\":{\"fake\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Fake\",\"options\":{\"baseURL\":\"http://${LLM}:9000/v1\",\"apiKey\":\"x\"},\"models\":{\"echo\":{\"name\":\"Echo\"}}}},\"model\":\"fake/echo\"}"
+CFG="{\"provider\":{\"fake\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Fake\",\"options\":{\"baseURL\":\"http://${LLM}:9000/v1\",\"apiKey\":\"x\"},\"models\":{\"echo\":{\"name\":\"Echo\",\"attachment\":true,\"modalities\":{\"input\":[\"text\",\"image\"],\"output\":[\"text\"]}}}}},\"model\":\"fake/echo\"}"
 docker run -d --name "$NAME" --network "$NET" -e PORT="$PORT" -e OPENCODE_SERVER_PASSWORD="$KEY" \
   -e OPENCODE_CONFIG_CONTENT="$CFG" -e OPENAI_COMPAT_TIMEOUT_SECONDS=3 -p "${PORT}:${PORT}" "$IMAGE" >/dev/null
 for _ in $(seq 1 60); do curl -sf -o /dev/null -u "opencode:${KEY}" "${BASE}/global/health" && break; sleep 1; done
@@ -43,18 +43,27 @@ expect "lists fake/echo" '"id":"fake/echo"' "$(curl -s -H "Authorization: Bearer
 echo "== chat"
 R="$(chat '{"model":"fake/echo","messages":[{"role":"system","content":"ADAPTER-SYSTEM-MARKER"},{"role":"user","content":"hello adapter"}]}')"
 expect "non-stream completion" '"object":"chat.completion"' "$R"
-expect "reply text from model" 'FAKE-REPLY[sys=yes]: hello adapter' "$R"
+expect "reply text from model" 'FAKE-REPLY[sys=yes][img=0]: hello adapter' "$R"
 expect "usage reported" '"total_tokens":18' "$R"
 R="$(chat '{"model":"fake/echo","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"stream me"}]}')"
 expect "stream chunks" '"object":"chat.completion.chunk"' "$R"
 expect "stream carries history" 'User: stream me' "$R"
 expect "stream ends with [DONE]" 'data: [DONE]' "$R"
 expect "default model when omitted" 'FAKE-REPLY' "$(chat '{"messages":[{"role":"user","content":"x"}]}')"
-expect "content parts array accepted" 'FAKE-REPLY[sys=no]: partsok' "$(chat '{"messages":[{"role":"user","content":[{"type":"text","text":"parts"},{"type":"text","text":"ok"}]}]}')"
+expect "content parts array accepted" 'FAKE-REPLY[sys=no][img=0]: partsok' "$(chat '{"messages":[{"role":"user","content":[{"type":"text","text":"parts"},{"type":"text","text":"ok"}]}]}')"
+
+echo "== images"
+PNG='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
+expect "data: URL image reaches model" '[img=1]: look' "$(chat "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"${PNG}\"}}]}]}")"
+expect "http(s) image downloaded and sent" '[img=1]' "$(chat "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"remote\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/test.png\"}}]}]}")"
+expect "two images in one message" '[img=2]' "$(chat "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"two\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"${PNG}\"}},{\"type\":\"image_url\",\"image_url\":\"${PNG}\"}]}]}")"
+expect "svg rejected -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/svg+xml;base64,PHN2Zy8+"}}]}]}')"
+expect "non-image download -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/v1/models\"}}]}]}")"
+expect "file:// url rejected -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///etc/passwd"}}]}]}')"
+expect "audio part -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}')"
 
 echo "== errors"
 expect "bad model id -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"echo","messages":[{"role":"user","content":"x"}]}')"
-expect "image content -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}')"
 expect "invalid JSON -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{')"
 expect "unknown /v1 route -> 404 JSON" 'unknown_url' "$(curl -s -H "Authorization: Bearer ${KEY}" "${BASE}/v1/embeddings")"
 expect "timeout -> 504" 504 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":"SLOW please"}]}')"

@@ -94,7 +94,15 @@ http
       const sys = msgs.some((m) => m.role === 'system' && text(m).includes('ADAPTER-SYSTEM-MARKER')) ? 'yes' : 'no';
       const reply = `FAKE-REPLY[sys=${sys}][img=${images(lastUser)}]: ${lastUser ? text(lastUser).slice(-200) : ''}`;
       const toolResult = msgs.find((m) => m.role === 'tool');
-      seen.push({ prompt: lastUser ? text(lastUser).slice(-80) : '', tools: (body.tools || []).length, toolResult: toolResult ? text(toolResult).slice(0, 200) : null });
+      const users = msgs.filter((m) => m.role === 'user');
+      seen.push({
+        prompt: lastUser ? text(lastUser).slice(-80) : '',
+        tools: (body.tools || []).length,
+        toolResult: toolResult ? text(toolResult).slice(0, 200) : null,
+        // How the history arrived: as separate turns (session reuse) or flattened into one prompt.
+        users: users.length,
+        transcript: users.some((m) => text(m).includes('Conversation so far')),
+      });
       // "TOOLCALL" asks for a bash call that would print and save the server password;
       // once a tool result comes back, the reply repeats it.
       // "TOOLEXT" asks for a command outside the project, which makes OpenCode ask for permission.

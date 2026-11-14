@@ -15,7 +15,7 @@ expect() { local desc="$1" want="$2" got="$3"; if [[ "$got" == *"$want"* ]]; the
 code() { curl -s -m 30 -o /dev/null -w '%{http_code}' "$@"; }
 chat() { curl -s -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "$1"; }
 
-cleanup() { docker rm -f "$NAME" "$LLM" >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
+cleanup() { docker rm -f "$NAME" "$LLM" "${NAME}-evict" "${NAME}-off" >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
 trap cleanup EXIT
 
 # Host path for the bind mount (Git Bash needs a Windows-style path).
@@ -98,14 +98,85 @@ PEAK="$(docker exec "$NAME" sh -c 'grep VmHWM /proc/$(pgrep -f openai-adapter/se
 (( ${PEAK:-0} > 0 && PEAK < 150 * 1024 )) && pass "adapter peak memory stayed low ($(( PEAK / 1024 )) MB)" || fail "adapter peak memory ${PEAK:-?} kB"
 expect "audio part -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}')"
 
+echo "== session reuse"
+# post <base> <auth-header> <json>  -> prints "<reused-header> <body>"
+post() { curl -s -m 30 -H "$2" -H 'content-type: application/json' -w '\n%header{x-opencode-session-reused}' "$1/v1/chat/completions" -d "$3"; }
+reusedof() { tail -n 1 <<<"$1" | tr -d '\r'; }
+contentof() { head -n -1 <<<"$1" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{s=s.trim();if(s.startsWith("data:")){let t="";for(const l of s.split("\n"))if(l.startsWith("data:")&&!l.includes("[DONE]")){const j=JSON.parse(l.slice(5));const d=j.choices&&j.choices[0]&&j.choices[0].delta;if(d&&d.content)t+=d.content}process.stdout.write(t)}else process.stdout.write(JSON.parse(s).choices[0].message.content)})'; }
+# add <messages-json> <role> <content> -> messages with one more message
+add() { node -e 'const [m,r,c]=process.argv.slice(1);const a=JSON.parse(m);a.push({role:r,content:c});process.stdout.write(JSON.stringify(a))' "$1" "$2" "$3"; }
+req() { node -e 'const [m,s]=process.argv.slice(1);process.stdout.write(JSON.stringify({model:"fake/echo",stream:s==="1",messages:JSON.parse(m)}))' "$1" "${2:-0}"; }
+nsess() { curl -s -u "opencode:${KEY}" "$1/session" | grep -o '"title":"openai-compat' | wc -l | tr -d ' '; }
+lastseen() { docker exec "$NAME" curl -s "http://${LLM}:9000/requests" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=JSON.parse(s);const x=a[a.length-1];console.log("users="+x.users+" transcript="+x.transcript)})'; }
+BA="Authorization: Bearer ${KEY}"
+
+S0="$(nsess "$BASE")"
+M='[{"role":"system","content":"keep it short"},{"role":"user","content":"REUSE one"}]'
+R="$(post "$BASE" "$BA" "$(req "$M")")"; expect "turn 1 starts a new session" 'false' "$(reusedof "$R")"
+M="$(add "$M" assistant "$(contentof "$R")")"; M="$(add "$M" user "REUSE two")"
+R="$(post "$BASE" "$BA" "$(req "$M")")"; expect "turn 2 reuses the session" 'true' "$(reusedof "$R")"
+expect "turn 2 reached the model as separate turns, not a transcript" 'users=2 transcript=false' "$(lastseen)"
+# Turn 3 streamed, and the client sends the reply back with surrounding whitespace and as content parts.
+M="$(add "$M" assistant "  $(contentof "$R")  ")"; M="$(add "$M" user "REUSE three")"
+R="$(post "$BASE" "$BA" "$(req "$M" 1)")"; expect "turn 3 (streamed) reuses the session" 'true' "$(reusedof "$R")"
+C3="$(contentof "$R")"
+M="$(node -e 'const [m,c]=process.argv.slice(1);const a=JSON.parse(m);a.push({role:"assistant",content:[{type:"text",text:c}]},{role:"user",content:[{type:"text",text:"REUSE four"}]});process.stdout.write(JSON.stringify(a))' "$M" "$C3")"
+R="$(post "$BASE" "$BA" "$(req "$M")")"; expect "turn 4 after a streamed reply (array content) reuses the session" 'true' "$(reusedof "$R")"
+expect "turn 4 reached the model as separate turns" 'users=4 transcript=false' "$(lastseen)"
+expect "four turns made exactly one OpenCode session" "$((S0 + 1))" "$(nsess "$BASE")"
+
+R="$(post "$BASE" "$BA" "$(req '[{"role":"user","content":"REUSE other conversation"}]')")"
+expect "a new conversation starts a new session" 'false' "$(reusedof "$R")"
+expect "...and it is the second session" "$((S0 + 2))" "$(nsess "$BASE")"
+
+E='[{"role":"user","content":"REUSE edit"}]'; R="$(post "$BASE" "$BA" "$(req "$E")")"
+E2="$(add "$E" assistant "an edited reply")"; E2="$(add "$E2" user "REUSE after edit")"
+R="$(post "$BASE" "$BA" "$(req "$E2")")"; expect "edited history misses and starts a new session" 'false' "$(reusedof "$R")"
+expect "...and the model got the full transcript" 'transcript=true' "$(lastseen)"
+
+K='[{"role":"user","content":"REUSE key"}]'; R="$(post "$BASE" "$BA" "$(req "$K")")"
+K2="$(add "$K" assistant "$(contentof "$R")")"; K2="$(add "$K2" user "REUSE other credential")"
+R="$(post "$BASE" "Authorization: Basic $(printf 'opencode:%s' "$KEY" | base64)" "$(req "$K2")")"
+expect "another credential never reuses the session" 'false' "$(reusedof "$R")"
+
+B='[{"role":"user","content":"REUSE busy"}]'; R="$(post "$BASE" "$BA" "$(req "$B")")"; B1="$(add "$B" assistant "$(contentof "$R")")"
+post "$BASE" "$BA" "$(req "$(add "$B1" user "SLOW hold the session")")" >/dev/null &
+sleep 1
+R="$(post "$BASE" "$BA" "$(req "$(add "$B1" user "REUSE while busy")")")"
+expect "a busy session falls back to a new one" 'false' "$(reusedof "$R")"
+wait
+expect "reused header is exposed to browsers" 'x-opencode-session-reused' "$(curl -s -D - -o /dev/null -H "$BA" "${BASE}/v1/models" | tr 'A-Z' 'a-z' | grep expose)"
+expect "session counts are logged" 'reused=true sessions=' "$(docker logs "$NAME" 2>&1)"
+
+# Eviction and the off switch, each in its own short-lived container.
+extra() { local n="$1" p="$2"; shift 2
+  docker run -d --name "$n" --network "$NET" -e PORT="$p" -e OPENCODE_SERVER_PASSWORD="$KEY" -e OPENCODE_CONFIG_CONTENT="$CFG" "$@" -p "${p}:${p}" "$IMAGE" >/dev/null
+  for _ in $(seq 1 60); do curl -sf -o /dev/null -u "opencode:${KEY}" "http://localhost:${p}/global/health" && break; sleep 1; done; }
+X1="${NAME}-evict"; P1=$((PORT + 1)); B1URL="http://localhost:${P1}"
+extra "$X1" "$P1" -e OPENAI_COMPAT_MAX_SESSIONS=2 -e OPENAI_COMPAT_SESSION_TTL_SECONDS=6
+for i in 1 2 3; do post "$B1URL" "$BA" "$(req "[{\"role\":\"user\",\"content\":\"EVICT $i\"}]")" >/dev/null; done
+sleep 1
+expect "over the maximum, the oldest session is deleted" '2' "$(nsess "$B1URL")"
+sleep 12
+expect "idle sessions are deleted after the TTL" '0' "$(nsess "$B1URL")"
+docker rm -f "$X1" >/dev/null 2>&1
+X2="${NAME}-off"; P2=$((PORT + 2)); B2URL="http://localhost:${P2}"
+extra "$X2" "$P2" -e OPENAI_COMPAT_REUSE_SESSIONS=false
+O='[{"role":"user","content":"OFF one"}]'; R="$(post "$B2URL" "$BA" "$(req "$O")")"
+R="$(post "$B2URL" "$BA" "$(req "$(add "$(add "$O" assistant "$(contentof "$R")")" user "OFF two")")")"
+expect "with reuse off, every request gets a new session" 'false' "$(reusedof "$R")"
+sleep 1
+expect "with reuse off, sessions are deleted after each request" '0' "$(nsess "$B2URL")"
+docker rm -f "$X2" >/dev/null 2>&1
+
 echo "== client gone"
 nreq() { docker exec "$NAME" curl -s "http://${LLM}:9000/requests" | grep -o '"prompt"' | wc -l | tr -d ' '; }
-BEFORE="$(nreq)"
+BEFORE="$(nreq)"; SBEFORE="$(nsess "$BASE")"
 curl -s -m 1 -o /dev/null -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" \
   -d "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"GONE\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/slow.png\"}}]}]}"
 sleep 4
 expect "client that left during download never reaches the model" "$BEFORE" "$(nreq)"
-expect "no session left behind" '0' "$(curl -s -u "opencode:${KEY}" "${BASE}/session" | grep -o 'openai-compat' | wc -l | tr -d ' ')"
+expect "no session left behind" "$SBEFORE" "$(nsess "$BASE")"
 
 echo "== concurrency"
 for i in $(seq 1 20); do
@@ -139,7 +210,8 @@ expect "timeout -> 504" 504 "$(code -H "Authorization: Bearer ${KEY}" -H 'conten
 
 echo "== cleanup + passthrough"
 sleep 1
-expect "adapter sessions deleted" '0' "$(curl -s -u "opencode:${KEY}" "${BASE}/session" | grep -o 'openai-compat' | wc -l | tr -d ' ')"
+OPEN="$(docker logs "$NAME" 2>&1 | grep -o 'open=[0-9]*' | tail -1 | cut -d= -f2)"
+sleep 2; expect "only sessions of open conversations remain (failed ones deleted)" "$OPEN" "$(nsess "$BASE")"; [[ "$OPEN" == "$(nsess "$BASE")" ]] || docker logs "$NAME" 2>&1 | grep -E "chat ses_|session ses_|evicted" | tail -60
 expect "web UI still behind Basic auth" 401 "$(code "${BASE}/")"
 expect "web UI served with auth" '<!doctype html>' "$(curl -s -u "opencode:${KEY}" "${BASE}/" | head -c 200 | tr 'A-Z' 'a-z')"
 expect "SSE passthrough" 'server.connected' "$(timeout 3 curl -sN -u "opencode:${KEY}" "${BASE}/event" | head -c 300)"

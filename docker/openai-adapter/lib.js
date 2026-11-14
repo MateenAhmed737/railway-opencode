@@ -4,6 +4,7 @@
  * checks. No I/O and no side effects on load, so tests/unit.test.js can require it.
  */
 const net = require('node:net');
+const crypto = require('node:crypto');
 
 const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
 
@@ -111,4 +112,50 @@ function errorMessage(err) {
   return (err.data && (err.data.message || err.data.responseBody)) || err.message || err.name || JSON.stringify(err);
 }
 
-module.exports = { badRequest, contentToParts, parseDataUrl, blockedAddress, buildPrompt, parseModel, errorMessage };
+// ------------------------------------------------------- conversations ----
+// OpenAI clients resend the whole history on every request. To keep one OpenCode
+// session per conversation, the adapter fingerprints the history it has already
+// answered and looks it up when the next request arrives.
+
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+
+/** One message reduced to what identifies it: role plus trimmed text; non-text parts by hash. */
+function normalizeMessage(m) {
+  const role = m && typeof m.role === 'string' ? m.role : '';
+  const c = m ? m.content : null;
+  if (c == null) return [role, ''];
+  if (typeof c === 'string') return [role, c.trim()];
+  if (!Array.isArray(c)) return [role, sha256(JSON.stringify(c))];
+  const out = [];
+  let text = '';
+  const flush = () => { if (text.trim()) out.push(text.trim()); text = ''; };
+  for (const p of c) {
+    if (typeof p === 'string') { text += p; continue; }
+    if (p && (p.type === 'text' || p.type === 'input_text')) { text += p.text || ''; continue; }
+    flush();
+    const url = p && (typeof p.image_url === 'string' ? p.image_url : (p.image_url && p.image_url.url) || (p.file && (p.file.file_data || p.file.url)) || p.url);
+    out.push(`#${sha256(String(url || JSON.stringify(p)))}`);
+  }
+  flush();
+  return [role, out.length === 1 ? out[0] : out];
+}
+
+/** Hash of a conversation for a given credential. Holds no message text. */
+function fingerprint(credential, messages) {
+  return sha256(JSON.stringify([credential, messages.map(normalizeMessage)]));
+}
+
+/**
+ * Split at the last assistant message: `prefix` is what a reused session already
+ * holds, `tail` the new messages after it. With no assistant message the prefix is empty.
+ */
+function splitConversation(messages) {
+  let i = -1;
+  for (let k = messages.length - 1; k >= 0; k--) if (messages[k] && messages[k].role === 'assistant') { i = k; break; }
+  return { prefix: messages.slice(0, i + 1), tail: messages.slice(i + 1) };
+}
+
+module.exports = {
+  badRequest, contentToParts, parseDataUrl, blockedAddress, buildPrompt, parseModel, errorMessage,
+  normalizeMessage, fingerprint, splitConversation,
+};

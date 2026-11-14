@@ -72,3 +72,41 @@ test('errorMessage prefers provider detail', () => {
   assert.equal(errorMessage({ name: 'X' }), 'X');
   assert.equal(errorMessage(null), 'Unknown error');
 });
+
+const { normalizeMessage, fingerprint, splitConversation } = require('../docker/openai-adapter/lib.js');
+
+test('splitConversation splits after the last assistant message', () => {
+  const m = [{ role: 'system', content: 's' }, { role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }];
+  assert.deepEqual(splitConversation(m), { prefix: m.slice(0, 3), tail: m.slice(3) });
+  assert.deepEqual(splitConversation(m.slice(0, 2)), { prefix: [], tail: m.slice(0, 2) });
+});
+
+test('normalizeMessage: string and text-parts content match, whitespace trimmed', () => {
+  assert.deepEqual(normalizeMessage({ role: 'user', content: '  hi there \n' }), ['user', 'hi there']);
+  assert.deepEqual(normalizeMessage({ role: 'user', content: [{ type: 'text', text: 'hi ' }, { type: 'text', text: 'there' }] }), ['user', 'hi there']);
+  assert.deepEqual(normalizeMessage({ role: 'assistant', content: null }), ['assistant', '']);
+});
+
+test('normalizeMessage: images are identified by a hash, never stored as data', () => {
+  const [, v] = normalizeMessage({ role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] });
+  assert.equal(v[0], 'look');
+  assert.match(v[1], /^#[0-9a-f]{64}$/);
+});
+
+test('fingerprint: stored reply matches the next request, across content shapes', () => {
+  const turn1 = [{ role: 'system', content: 'S' }, { role: 'user', content: 'hello' }];
+  const stored = fingerprint('cred', [...turn1, { role: 'assistant', content: 'Hi! ' }]);
+  // Next request, sent the way the openai SDK might: array-of-parts, trimmed reply.
+  const next = [{ role: 'system', content: 'S' }, { role: 'user', content: [{ type: 'text', text: 'hello' }] }, { role: 'assistant', content: 'Hi!' }, { role: 'user', content: 'more' }];
+  assert.equal(fingerprint('cred', splitConversation(next).prefix), stored);
+});
+
+test('fingerprint: edited history, other credential or other system prompt miss', () => {
+  const base = [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'Hi' }];
+  const fp = fingerprint('cred', base);
+  assert.notEqual(fingerprint('cred', [{ role: 'user', content: 'hello!' }, base[1]]), fp);
+  assert.notEqual(fingerprint('cred', [base[0], { role: 'assistant', content: 'Hello' }]), fp);
+  assert.notEqual(fingerprint('other', base), fp);
+  assert.notEqual(fingerprint('cred', [{ role: 'system', content: 'S' }, ...base]), fp);
+  assert.doesNotMatch(fp, /hello/);
+});

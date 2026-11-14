@@ -99,11 +99,15 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let over = false;
     req.on('data', (c) => {
+      if (over) return; // keep draining so the 413 can be delivered
       size += c.length;
       if (size > MAX_BODY) {
-        reject(Object.assign(new Error('Request body too large'), { status: 413 }));
-        req.destroy();
+        over = true;
+        chunks.length = 0;
+        req.resume();
+        reject(Object.assign(new Error(`Request body larger than ${MAX_BODY >> 20} MB`), { status: 413 }));
       } else chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
@@ -349,7 +353,8 @@ function buildPrompt(messages) {
 }
 
 function parseModel(model) {
-  if (!model || model === 'default' || model === 'opencode') return undefined;
+  if (model == null || model === '' || model === 'default' || model === 'opencode') return undefined;
+  if (typeof model !== 'string') throw badRequest('`model` must be a string like "providerID/modelID" (see GET /v1/models)');
   const i = String(model).indexOf('/');
   if (i <= 0 || i === model.length - 1) {
     throw Object.assign(new Error(`Model must be "providerID/modelID" (see GET /v1/models), got '${model}'`), { status: 400 });
@@ -429,8 +434,10 @@ async function handleChat(req, res) {
     body = JSON.parse(await readBody(req));
   } catch (e) {
     if (clientGone) return;
+    if (e.status === 413) res.setHeader('connection', 'close');
     return oaiError(res, e.status || 400, e.status ? e.message : 'Body must be valid JSON');
   }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return oaiError(res, 400, 'Body must be a JSON object');
   if (!Array.isArray(body.messages) || !body.messages.length) return oaiError(res, 400, '`messages` must be a non-empty array');
 
   let prompt, model;

@@ -1,0 +1,28 @@
+# HTTPS front for the VPS deployment (see docker-compose.yml and docs/vps.md).
+#
+# SITE_ADDRESS comes from .env:
+#   opencode.example.com   your own domain (A record -> server IP)
+#   203.0.113.7.sslip.io   no domain needed: sslip.io resolves to the IP in the name
+#   http://localhost       local test, plain HTTP on port 80, no certificate
+# Caddy gets and renews a Let's Encrypt certificate automatically. Ports 80
+# and 443 must be reachable from the internet for that.
+
+{$SITE_ADDRESS} {
+	# No `encode` (compression) on purpose: it can hold back server-sent events.
+
+	reverse_proxy opencode:4096 {
+		# Write every byte to the client immediately. Needed for OpenCode's SSE
+		# stream (/event) and the /v1/chat/completions keep-alives. Caddy already
+		# does this for text/event-stream; this makes it explicit for all routes.
+		# Websockets (/pty/:id/connect, the web terminal) are proxied natively.
+		flush_interval -1
+
+		# Caddy sets no read/response timeouts on proxied requests by default, so
+		# a /v1 call can run as long as the adapter allows
+		# (OPENAI_COMPAT_TIMEOUT_SECONDS, default 600). Don't add any here.
+
+		# Keep websockets and SSE streams open for 10 minutes across a Caddy
+		# config reload instead of cutting them immediately.
+		stream_close_delay 10m
+	}
+}

@@ -23,6 +23,8 @@ Railway edge (TLS) ──HTTP $PORT──▶ container
 
 Verified against OpenCode **1.19.5** (`opencode-ai` on npm). The flags used here come from `opencode web --help` in that version and from the [server docs](https://docs.opencode.ai/docs/server/).
 
+**Not on Railway?** The same image also runs on a home PC behind a Cloudflare Tunnel, or on any server with its own IP behind Caddy, with `docker compose`. See [docs/self-hosting.md](docs/self-hosting.md). That route exists because OpenCode's free models hit "Free usage exceeded" on Railway's shared outgoing IPs (see Troubleshooting).
+
 If you don't want the OpenAI API, set `OPENAI_COMPAT_ENABLED=false`. OpenCode then binds `0.0.0.0:$PORT` directly, with no adapter process in front.
 
 ## Files
@@ -39,6 +41,12 @@ railway-opencode/
 │   └── openai-adapter/
 │       └── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
 ├── railway.json                # build/deploy settings (see the note on Config as Code below)
+├── docker-compose.yml          # self-hosting: same image + Cloudflare Tunnel or Caddy (docs/self-hosting.md)
+├── .env.example                # settings for docker-compose.yml
+├── caddy/
+│   └── Caddyfile               # HTTPS reverse proxy for the self-hosted "caddy" profile
+├── docs/
+│   └── self-hosting.md         # home PC + Cloudflare Tunnel, or any server + Caddy
 ├── examples/
 │   └── pi-models.json          # pi coding agent provider config for the /v1 API
 ├── tests/
@@ -369,7 +377,7 @@ Both commands accept `-p/--password` (defaults to `OPENCODE_SERVER_PASSWORD`) an
 | Deploy never becomes healthy | Clear the Healthcheck Path in settings. `/global/health` requires auth |
 | "Application failed to respond" right after deploy | OpenCode is still starting. The public port opens once it's healthy (usually a few seconds). If it persists: don't hardcode `PORT`, and any target port on the domain must match `$PORT` |
 | `/v1/...` returns `401 invalid_api_key` | Use `Authorization: Bearer <OPENAI_COMPAT_API_KEY or OPENCODE_SERVER_PASSWORD>` |
-| `/v1/chat/completions` returns `429` "Free usage exceeded" | OpenCode's free models have a usage limit, and Railway apps share outgoing IPs, so you can hit it quickly. The error includes `Retry-After` and when OpenCode would retry. Options: wait for the reset, subscribe to OpenCode Go, or log in a provider of your own (section 7) and use its models. Without this check, OpenCode silently waits for the reset (seen: about 22 hours) and the request just hangs |
+| `/v1/chat/completions` returns `429` "Free usage exceeded" | OpenCode's free models have a usage limit, and Railway apps share outgoing IPs, so you can hit it quickly. The error includes `Retry-After` and when OpenCode would retry. Options: wait for the reset, run the image from your own IP ([docs/self-hosting.md](docs/self-hosting.md)), subscribe to OpenCode Go, or log in a provider of your own (section 7) and use its models. Without this check, OpenCode silently waits for the reset (seen: about 22 hours) and the request just hangs |
 | `/v1/chat/completions` returns `504` | OpenCode took longer than `OPENAI_COMPAT_TIMEOUT_SECONDS`, often because it's waiting for a permission approval. Raise the timeout or configure permissions |
 | `/v1/chat/completions` returns `401 ProviderAuthError` | The chosen provider isn't logged in. See section 7 |
 | `/v1/...` returns HTML | `OPENAI_COMPAT_ENABLED` is `false`, so OpenCode serves its web UI for unknown paths |

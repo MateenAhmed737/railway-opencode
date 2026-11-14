@@ -1,0 +1,104 @@
+# Self-hosted deployment: the same image as Railway, plus one HTTPS front.
+# Pick the front with COMPOSE_PROFILES in .env (see .env.example):
+#
+#   tunnel   Cloudflare Tunnel (needs a domain on Cloudflare). For a home PC: no
+#            open ports, works behind NAT.
+#   caddy    Caddy with automatic HTTPS on ports 80/443. For a server with its own
+#            public IPv4.
+#
+#   client ──HTTPS──▶ cloudflared | caddy ──http──▶ opencode:4096 (adapter) ──▶ opencode web 127.0.0.1:4097
+#
+# Ports: only Caddy publishes any (80, 443). The tunnel needs none, because
+# cloudflared dials out to Cloudflare. The adapter port 4096 is reachable only
+# on the compose network, and OpenCode's 4097 only inside its own container.
+#
+# Guide: docs/self-hosting.md.   Quick start:
+#   cp .env.example .env    # fill it in
+#   docker compose up -d --build
+#
+# Railway ignores this file (railway.json builds the Dockerfile directly).
+
+name: opencode
+
+x-logging: &logging
+  # Rotate container logs so a 24/7 box doesn't fill its disk (30 MB max per service).
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  opencode:
+    build: .
+    image: railway-opencode:local
+    restart: unless-stopped
+    environment:
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?Set OPENCODE_SERVER_PASSWORD in .env}
+      OPENCODE_SERVER_USERNAME: ${OPENCODE_SERVER_USERNAME:-opencode}
+      OPENAI_COMPAT_API_KEY: ${OPENAI_COMPAT_API_KEY:-}
+      OPENAI_COMPAT_ENABLED: ${OPENAI_COMPAT_ENABLED:-true}
+      OPENAI_COMPAT_AGENT: ${OPENAI_COMPAT_AGENT:-}
+      OPENAI_COMPAT_DIRECTORY: ${OPENAI_COMPAT_DIRECTORY:-}
+      OPENAI_COMPAT_TIMEOUT_SECONDS: ${OPENAI_COMPAT_TIMEOUT_SECONDS:-600}
+      OPENAI_COMPAT_KEEP_SESSIONS: ${OPENAI_COMPAT_KEEP_SESSIONS:-}
+      OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS: ${OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS:-30}
+      OPENAI_COMPAT_MAX_BODY_MB: ${OPENAI_COMPAT_MAX_BODY_MB:-25}
+      OPENAI_COMPAT_MAX_IMAGE_MB: ${OPENAI_COMPAT_MAX_IMAGE_MB:-10}
+      # Fixed: the front proxies to this port. Not published on the host.
+      PORT: "4096"
+    expose:
+      - "4096"
+    volumes:
+      # Everything OpenCode keeps (config, provider logins, sessions, workspace).
+      # A named volume survives `docker compose down`, rebuilds and upgrades.
+      # Only `docker compose down -v` deletes it.
+      - opencode_data:/data
+    # The adapter forwards SIGTERM and force-stops OpenCode after 8 s.
+    stop_grace_period: 30s
+    logging: *logging
+
+  # --- Front 1: Cloudflare Tunnel (needs a domain on Cloudflare) --------------
+  cloudflared:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:2026.10.1
+    restart: unless-stopped
+    depends_on:
+      - opencode
+    # The public hostname -> service mapping (http://opencode:4096) is set in
+    # the Cloudflare dashboard. The token alone is enough here.
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    logging: *logging
+
+  # --- Front 2: Caddy, automatic HTTPS (server with its own public IP) --------
+  caddy:
+    profiles: [caddy]
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    depends_on:
+      - opencode
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-}
+    command:
+      - sh
+      - -c
+      - |
+        [ -n "$$SITE_ADDRESS" ] || { echo 'Set SITE_ADDRESS in .env (a domain, or <server-ip>.sslip.io)' >&2; exit 1; }
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account. Keep it, or Caddy re-issues on every
+      # rebuild and can hit Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *logging
+
+volumes:
+  opencode_data:
+  caddy_data:
+  caddy_config:

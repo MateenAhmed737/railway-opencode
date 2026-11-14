@@ -37,14 +37,16 @@ railway-opencode/
 │   ├── entrypoint.sh           # password guard, /data setup, drop to non-root, start adapter or opencode
 │   ├── healthcheck.sh          # authenticated probe for Docker HEALTHCHECK
 │   └── openai-adapter/
-│       └── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
+│       ├── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
+│       └── lib.js              # pure request-parsing and address-check helpers
 ├── railway.json                # build/deploy settings (see the note on Config as Code below)
 ├── examples/
 │   └── pi-models.json          # pi coding agent provider config for the /v1 API
 ├── tests/
 │   ├── smoke-test.sh           # base checks: auth, $PORT, non-root, persistence, shutdown
 │   ├── adapter-test.sh         # OpenAI API checks against a fake model provider
-│   └── fake-llm.js             # tiny OpenAI-style model server used by adapter-test.sh
+│   ├── fake-llm.js             # tiny OpenAI-style model server used by adapter-test.sh
+│   └── unit.test.js            # node:test unit tests for lib.js (node --test tests/unit.test.js)
 └── README.md
 ```
 

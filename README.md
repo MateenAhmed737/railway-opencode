@@ -133,7 +133,7 @@ Without the `gh` CLI: create an empty **private** repo on github.com, then run `
 2. Railway detects the `Dockerfile` and builds with it. ("Railway will always build with a Dockerfile if it finds one.")
 3. Before the first deploy succeeds you must add the variables in step 4. Without a password the container exits on purpose, which is expected.
 
-> **Note on `railway.json`.** Railway has deprecated Config as Code. Its docs say *"New services cannot opt into Config as Code"* and existing files stop being read on **2026-12-01**. The included `railway.json` (builder `DOCKERFILE`, restart `ON_FAILURE` with 10 retries) records the intended settings. For a new service, set them in the dashboard. They are all listed below. Railway's replacement is Infrastructure as Code (`.railway/railway.ts`). It isn't included here because I couldn't verify its Dockerfile-builder options.
+> **Note on `railway.json`.** Railway has deprecated Config as Code. Its docs say *"New services cannot opt into Config as Code"* and existing files stop being read on **2026-12-01**. The included `railway.json` (builder `DOCKERFILE`, restart `ALWAYS`) records the intended settings. For a new service, set them in the dashboard. They are all listed below. Railway's replacement is Infrastructure as Code (`.railway/railway.ts`). It isn't included here because I couldn't verify its Dockerfile-builder options.
 
 **Service settings to confirm in the dashboard (Service → Settings):**
 
@@ -141,7 +141,7 @@ Without the `gh` CLI: create an empty **private** repo on github.com, then run `
 |---|---|
 | Builder | Dockerfile (`Dockerfile` at repo root) |
 | Start command | *(leave empty: the image ENTRYPOINT is used)* |
-| Restart policy | On Failure, max 10 retries |
+| Restart policy | Always. On Failure would leave the service down after a clean exit or after its retry limit runs out |
 | Replicas | **1**. Railway: "Replicas cannot be used with volumes" |
 | Healthcheck path | **leave empty** (see below) |
 | Serverless / app sleeping | Off (sleeping would drop live sessions) |

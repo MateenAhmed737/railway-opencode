@@ -66,6 +66,10 @@ services:
       - opencode
     # The public hostname -> service mapping (http://opencode:4096) is set in
     # the Cloudflare dashboard. The token alone is enough here.
+    # Without CLOUDFLARE_TUNNEL_TOKEN this container exits and restarts in a loop.
+    # The image has no shell, so it can't refuse to start cleanly the way caddy
+    # does, and a compose-level `:?` check would also break the caddy profile.
+    # Check `docker compose logs cloudflared` if the tunnel doesn't come up.
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}

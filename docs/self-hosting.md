@@ -62,6 +62,8 @@ CLOUDFLARE_TUNNEL_TOKEN=eyJ...
 
 (On Windows without `openssl`, any password manager's 32+ character random password is fine.)
 
+If `CLOUDFLARE_TUNNEL_TOKEN` is empty, `cloudflared` exits with *"requires the ID or name of the tunnel"* and keeps restarting. The image has no shell, so it can't stop with a friendly message the way Caddy does; set the token and run `docker compose up -d` again.
+
 ```bash
 docker compose up -d --build
 docker compose ps        # opencode should become "healthy" within a minute

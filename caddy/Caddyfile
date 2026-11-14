@@ -1,4 +1,4 @@
-# HTTPS front for the VPS deployment (see docker-compose.yml and docs/vps.md).
+# HTTPS front for the VPS deployment (see docker-compose.yml and docs/self-hosting.md).
 #
 # SITE_ADDRESS comes from .env:
 #   opencode.example.com   your own domain (A record -> server IP)

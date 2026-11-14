@@ -30,6 +30,10 @@ const KEEP_SESSIONS = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_KEEP_SESSIONS || 
 const TIMEOUT_MS = int(env.OPENAI_COMPAT_TIMEOUT_SECONDS, 600) * 1000;
 // If OpenCode schedules a provider retry further out than this, fail fast with 429.
 const MAX_RETRY_WAIT_MS = int(env.OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS, 30) * 1000;
+// `stream: true` forwards text as OpenCode writes it. Set this to send the whole answer in one chunk at the end instead.
+const BUFFER_STREAM = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_BUFFER_STREAM || '');
+// Live streams hold back the HTTP 200 until the first text (or this long), so an early rate limit can still be a real 429.
+const STREAM_OPEN_DELAY_MS = 8000;
 const MAX_BODY = int(env.OPENAI_COMPAT_MAX_BODY_MB, 25) * 1024 * 1024;
 const MAX_REMOTE_FILE = int(env.OPENAI_COMPAT_MAX_IMAGE_MB, 10) * 1024 * 1024;
 const FILE_MIME = /^(image\/(png|jpe?g|gif|webp)|application\/pdf)$/i;
@@ -136,9 +140,13 @@ function oc(method, path, body, signal) {
  * function that stops watching.
  */
 function watchSession(sessionID, dir, onEvent) {
+  let ready;
+  const connected = new Promise((r) => { ready = r; });
+  setTimeout(ready, 5000).unref(); // never block a prompt on the watcher for long
   const req = http.request(
     { host: '127.0.0.1', port: UP_PORT, method: 'GET', path: withDir('/event', dir), headers: { authorization: UP_AUTH, accept: 'text/event-stream' } },
     (res) => {
+      ready();
       res.setEncoding('utf8');
       let buf = '';
       res.on('data', (chunk) => {
@@ -160,9 +168,11 @@ function watchSession(sessionID, dir, onEvent) {
       res.on('error', () => {});
     },
   );
-  req.on('error', () => {});
+  req.on('error', () => ready());
   req.end();
-  return () => req.destroy();
+  const stop = () => req.destroy();
+  stop.connected = connected;
+  return stop;
 }
 
 const withDir = (path, dir) => `${path}${path.includes('?') ? '&' : '?'}directory=${encodeURIComponent(dir)}`;
@@ -345,27 +355,91 @@ async function chatCompletions(req, res) {
     if (!res.writableFinished) { clientGone = true; ac.abort(); }
   });
 
-  // Streaming: open the SSE response now and keep it alive while OpenCode works.
-  let keepalive;
+  // Streaming. The SSE response is opened lazily: on the first live text, or after
+  // STREAM_OPEN_DELAY_MS (buffered mode opens at once). Until then errors can still
+  // be sent as real HTTP statuses. Once open, keep-alive comments fill silent gaps.
+  const live = stream && !BUFFER_STREAM;
   const id = `chatcmpl-${sessionID}`;
+  let opened = false;
+  let lastWrite = 0;
+  let keepalive, openTimer;
+  const write = (s) => { lastWrite = Date.now(); res.write(s); };
   const chunk = (delta, finish_reason = null, extra = {}) =>
-    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'default', choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`);
-  if (stream) {
+    write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model || 'default', choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`);
+  const open = () => {
+    if (opened || clientGone || res.headersSent) return;
+    opened = true;
+    clearTimeout(openTimer);
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache',
+      'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
       'x-opencode-session': sessionID,
     });
     res.flushHeaders();
+    if (res.socket) res.socket.setNoDelay(true);
     chunk({ role: 'assistant', content: '' });
-    keepalive = setInterval(() => res.write(': keepalive\n\n'), 15000);
+    keepalive = setInterval(() => { if (Date.now() - lastWrite >= 15000) write(': keepalive\n\n'); }, 5000);
+  };
+  if (stream) {
+    if (live) openTimer = setTimeout(open, STREAM_OPEN_DELAY_MS);
+    else open();
   }
+  // Error reply that fits the current state: an SSE error event once the stream is open, a real HTTP status before.
+  const fail = (status, message, type, code = null, headers = {}) => {
+    if (opened) {
+      write(`data: ${JSON.stringify({ error: { message, type, ...(code ? { code } : {}) } })}\n\ndata: [DONE]\n\n`);
+      return res.end();
+    }
+    for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+    return oaiError(res, status, message, type, code);
+  };
+
+  // Live text. Assistant text parts are forwarded as `content`, reasoning parts as
+  // `reasoning_content`; tool and other parts are skipped. `sent` tracks how much of
+  // each part went out, so a full-text update only sends its unsent tail. Text parts
+  // are separated by a blank line, matching the non-streamed join below.
+  const roles = new Map();   // messageID -> role
+  const parts = new Map();   // partID -> { type, messageID }
+  const sent = new Map();    // partID -> characters already sent
+  let streamedText = false;
+  const emit = (partID, type, text) => {
+    if (!text || clientGone) return;
+    if (type === 'text') {
+      const sep = !sent.has(partID) && streamedText ? '\n\n' : '';
+      open();
+      chunk({ content: sep + text });
+      streamedText = true;
+    } else {
+      open();
+      chunk({ reasoning_content: text });
+    }
+    sent.set(partID, (sent.get(partID) || 0) + text.length);
+  };
+  const forward = (ev) => {
+    const p = ev.properties || {};
+    if (ev.type === 'message.updated' && p.info) { roles.set(p.info.id, p.info.role); return; }
+    if (ev.type === 'message.part.updated' && p.part) {
+      const part = p.part;
+      parts.set(part.id, { type: part.type, messageID: part.messageID });
+      if (roles.get(part.messageID) !== 'assistant' || part.synthetic || part.ignored) return;
+      if ((part.type === 'text' || part.type === 'reasoning') && typeof part.text === 'string') {
+        emit(part.id, part.type, part.text.slice(sent.get(part.id) || 0));
+      }
+      return;
+    }
+    if (ev.type === 'message.part.delta' && p.field === 'text' && typeof p.delta === 'string') {
+      const part = parts.get(p.partID);
+      if (!part || roles.get(p.messageID) !== 'assistant') return; // unknown part: its part.updated will catch up
+      if (part.type === 'text' || part.type === 'reasoning') emit(p.partID, part.type, p.delta);
+    }
+  };
 
   // Fail fast instead of hanging when the provider is rate-limiting us.
   let rateLimited = null;
   const stopWatching = watchSession(sessionID, dir, (ev) => {
+    if (live && !rateLimited) forward(ev);
     if (ev.type !== 'session.status' || !ev.properties.status || ev.properties.status.type !== 'retry') return;
     const st = ev.properties.status;
     const waitMs = typeof st.next === 'number' ? st.next - Date.now() : 0;
@@ -382,10 +456,14 @@ async function chatCompletions(req, res) {
 
   const cleanup = () => {
     clearTimeout(timer);
+    clearTimeout(openTimer);
     stopWatching();
     if (keepalive) clearInterval(keepalive);
     if (!KEEP_SESSIONS) oc('DELETE', withDir(`/session/${sessionID}`, dir)).catch(() => {});
   };
+
+  // Subscribe before prompting so no early text or retry status is missed.
+  await stopWatching.connected;
 
   // 2. prompt
   let r;
@@ -409,14 +487,11 @@ async function chatCompletions(req, res) {
       const when = new Date(Date.now() + rateLimited.retryAfter * 1000).toISOString();
       const msg = `${rateLimited.message} (OpenCode would retry at ${when})`;
       log(`chat ${sessionID} rate limited: ${rateLimited.reason}, retry in ${rateLimited.retryAfter}s`);
-      if (stream) { res.write(`data: ${JSON.stringify({ error: { message: msg, type: 'rate_limit_error', code: rateLimited.reason } })}\n\ndata: [DONE]\n\n`); return res.end(); }
-      res.setHeader('retry-after', String(rateLimited.retryAfter));
-      return oaiError(res, 429, msg, 'rate_limit_error', rateLimited.reason);
+      return fail(429, msg, 'rate_limit_error', rateLimited.reason, { 'retry-after': String(rateLimited.retryAfter) });
     }
     const msg = timedOut ? `OpenCode did not finish within ${TIMEOUT_MS / 1000}s (it may be waiting for a permission approval)` : `OpenCode request failed: ${e.message}`;
     log(`chat ${sessionID} failed: ${msg}`);
-    if (stream) { res.write(`data: ${JSON.stringify({ error: { message: msg, type: 'api_error' } })}\n\ndata: [DONE]\n\n`); return res.end(); }
-    return oaiError(res, timedOut ? 504 : 502, msg, 'api_error');
+    return fail(timedOut ? 504 : 502, msg, 'api_error');
   }
   cleanup();
 
@@ -424,21 +499,16 @@ async function chatCompletions(req, res) {
   if (r.status !== 200 || !info) {
     const msg = (r.json && (r.json.message || (r.json.data && r.json.data.message))) || `OpenCode returned ${r.status}`;
     log(`chat ${sessionID} upstream ${r.status}`);
-    if (stream) { res.write(`data: ${JSON.stringify({ error: { message: msg, type: 'api_error' } })}\n\ndata: [DONE]\n\n`); return res.end(); }
-    return oaiError(res, r.status >= 400 && r.status < 500 ? r.status : 502, msg, 'api_error');
+    return fail(r.status >= 400 && r.status < 500 ? r.status : 502, msg, 'api_error');
   }
   if (info.error && info.error.name !== 'MessageOutputLengthError') {
     const msg = errorMessage(info.error);
     log(`chat ${sessionID} model error: ${info.error.name}`);
-    const status = info.error.name === 'ProviderAuthError' ? 401 : 502;
-    if (stream) { res.write(`data: ${JSON.stringify({ error: { message: msg, type: 'api_error', code: info.error.name } })}\n\ndata: [DONE]\n\n`); return res.end(); }
-    return oaiError(res, status, msg, 'api_error', info.error.name);
+    return fail(info.error.name === 'ProviderAuthError' ? 401 : 502, msg, 'api_error', info.error.name);
   }
 
-  const content = (r.json.parts || [])
-    .filter((p) => p.type === 'text' && !p.synthetic && !p.ignored && p.text)
-    .map((p) => p.text)
-    .join('\n\n');
+  const finalText = (r.json.parts || []).filter((p) => p.type === 'text' && !p.synthetic && !p.ignored && p.text);
+  const content = finalText.map((p) => p.text).join('\n\n');
   const finish_reason = info.error && info.error.name === 'MessageOutputLengthError' ? 'length' : 'stop';
   const t = info.tokens || {};
   const usage = {
@@ -451,10 +521,14 @@ async function chatCompletions(req, res) {
   log(`chat ${sessionID} ok model=${modelName} ${Date.now() - started}ms`);
 
   if (stream) {
-    if (content) chunk({ content });
+    if (live) {
+      // Safety net: send any part of the final answer the event stream did not deliver.
+      for (const p of finalText) emit(p.id, 'text', p.text.slice(sent.get(p.id) || 0));
+      open();
+    } else if (content) chunk({ content });
     chunk({}, finish_reason);
-    if (includeUsage) res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: modelName, choices: [], usage })}\n\n`);
-    res.write('data: [DONE]\n\n');
+    if (includeUsage) write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: modelName, choices: [], usage })}\n\n`);
+    write('data: [DONE]\n\n');
     return res.end();
   }
 

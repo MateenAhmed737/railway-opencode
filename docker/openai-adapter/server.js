@@ -17,7 +17,7 @@ const dns = require('node:dns');
 const net = require('node:net');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { badRequest, contentToParts, parseDataUrl, blockedAddress, buildPrompt, parseModel, errorMessage } = require('./lib.js');
+const { badRequest, contentToParts, parseDataUrl, blockedAddress, buildPrompt, parseModel, errorMessage, fingerprint, splitConversation } = require('./lib.js');
 
 const env = process.env;
 const int = (v, d) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : d);
@@ -40,6 +40,10 @@ const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || '';
 const ALLOW_OVERRIDES = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_ALLOW_OVERRIDES || '');
 const CHAT_AGENT = { mode: 'primary', description: 'Plain chat, no tools', prompt: 'You are a helpful assistant.', permission: { '*': 'deny' } };
 const KEEP_SESSIONS = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_KEEP_SESSIONS || '');
+// One OpenCode session per conversation (see "Session reuse" below). Off = a new session per request.
+const REUSE_SESSIONS = !/^(0|false|no)$/i.test(env.OPENAI_COMPAT_REUSE_SESSIONS || '');
+const SESSION_TTL_MS = int(env.OPENAI_COMPAT_SESSION_TTL_SECONDS, 21600) * 1000;
+const MAX_SESSIONS = int(env.OPENAI_COMPAT_MAX_SESSIONS, 50);
 const TIMEOUT_MS = int(env.OPENAI_COMPAT_TIMEOUT_SECONDS, 600) * 1000;
 // If OpenCode schedules a provider retry further out than this, fail fast with 429.
 const MAX_RETRY_WAIT_MS = int(env.OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS, 30) * 1000;
@@ -305,6 +309,54 @@ async function listModels(req, res) {
   sendJson(res, 200, { object: 'list', data });
 }
 
+// ---------------------------------------------------------- session reuse ---
+// OpenAI clients resend the whole conversation each time. After a reply, the
+// adapter stores fingerprint(credential, messages + reply) -> session; the next
+// request whose history up to its last assistant message has that fingerprint
+// continues in the same session and sends only the new messages. The map holds
+// hashes and ids only. An entry is taken out while its session is in use, so a
+// second request for the same conversation simply gets a new session.
+const conversations = new Map(); // fingerprint -> { sessionID, dir, lastUsed }  (insertion order = LRU)
+const stats = { requests: 0, sessionsCreated: 0, sessionsToday: 0, day: new Date().toISOString().slice(0, 10) };
+function countSession() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (day !== stats.day) { stats.day = day; stats.sessionsToday = 0; }
+  stats.sessionsCreated++;
+  stats.sessionsToday++;
+}
+function deleteSession(sessionID, dir) {
+  if (KEEP_SESSIONS) return Promise.resolve();
+  return oc('DELETE', withDir(`/session/${sessionID}`, dir), undefined, AbortSignal.timeout(5000)).catch(() => {});
+}
+function takeConversation(fp) {
+  const e = conversations.get(fp);
+  if (!e) return null;
+  conversations.delete(fp);
+  return e;
+}
+function storeConversation(fp, entry) {
+  entry.lastUsed = Date.now();
+  conversations.delete(fp);
+  conversations.set(fp, entry);
+  while (conversations.size > MAX_SESSIONS) {
+    const [oldFp, old] = conversations.entries().next().value;
+    conversations.delete(oldFp);
+    log(`session ${old.sessionID} evicted (more than ${MAX_SESSIONS} conversations)`);
+    deleteSession(old.sessionID, old.dir);
+  }
+}
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [fp, e] of conversations) {
+    if (e.lastUsed > cutoff) continue;
+    conversations.delete(fp);
+    log(`session ${e.sessionID} evicted (idle)`);
+    deleteSession(e.sessionID, e.dir);
+  }
+}, Math.min(60_000, Math.max(1000, SESSION_TTL_MS / 4))).unref();
+/** Identifies the caller's credential without keeping it: a reused session never serves another key. */
+const credentialId = (req) => crypto.createHash('sha256').update(String(req.headers.authorization || '')).digest('hex');
+
 // At most MAX_CONCURRENCY chat requests run at once; others wait up to QUEUE_WAIT_MS, then get a 429.
 const MAX_CONCURRENCY = int(env.OPENAI_COMPAT_MAX_CONCURRENCY, 4);
 const QUEUE_WAIT_MS = 10_000;
@@ -371,36 +423,71 @@ async function handleChat(req, res) {
     return oaiError(res, e.status || 400, e.message);
   }
 
-  // Images/PDFs -> OpenCode file parts (remote URLs downloaded here, before any session exists).
-  let fileParts;
-  try {
-    const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(60_000)]);
-    fileParts = await Promise.all(prompt.files.map((f, i) => resolveFile(f, i, signal)));
-  } catch (e) {
-    if (clientGone) return log('chat cancelled by client during file download');
-    return oaiError(res, e.status || 400, e.status ? e.message : 'Could not download an attached file');
-  }
-  if (clientGone) return log('chat cancelled by client before start');
-
   const dir = (ALLOW_OVERRIDES && req.headers['x-opencode-directory']) || DEFAULT_DIR;
   const agent = (ALLOW_OVERRIDES && req.headers['x-opencode-agent']) || DEFAULT_AGENT;
   const stream = body.stream === true;
   const includeUsage = !!(body.stream_options && body.stream_options.include_usage);
   const created = Math.floor(Date.now() / 1000);
+  const cred = `${credentialId(req)}|${dir}`;
+  stats.requests++;
 
-  // 1. session
-  let s;
-  try {
-    s = await oc('POST', withDir('/session', dir), { title: `openai-compat ${new Date().toISOString()}` }, AbortSignal.any([ac.signal, AbortSignal.timeout(30_000)]));
-  } catch (e) {
-    if (clientGone) return log('chat cancelled by client during session create');
-    return oaiError(res, 502, `Could not create OpenCode session (${e.message})`, 'api_error');
+  // 1. session: continue the conversation's session if the history matches, else a new one.
+  // A reused session already holds the earlier turns, so only the new messages are sent.
+  let reused = null;
+  let send = prompt;
+  if (REUSE_SESSIONS) {
+    const { prefix, tail } = splitConversation(body.messages);
+    const e = prefix.length ? takeConversation(fingerprint(cred, prefix)) : null;
+    if (e) {
+      let ok = false;
+      try {
+        const t = buildPrompt(tail.filter((m) => m && m.role !== 'system' && m.role !== 'developer'));
+        const check = await oc('GET', withDir(`/session/${e.sessionID}`, dir), undefined, AbortSignal.any([ac.signal, AbortSignal.timeout(10_000)]));
+        if (check.status === 200) { reused = e; send = { system: prompt.system, text: t.text, files: t.files }; ok = true; }
+        else log(`session ${e.sessionID} is gone (${check.status}); starting a new one`);
+      } catch {}
+      if (!ok) deleteSession(e.sessionID, e.dir);
+    }
   }
-  if (s.status !== 200 || !s.json || !s.json.id) return oaiError(res, 502, `Could not create OpenCode session (${s.status})`, 'api_error');
-  const sessionID = s.json.id;
+  if (clientGone) {
+    if (reused) deleteSession(reused.sessionID, dir);
+    return log('chat cancelled by client before start');
+  }
+
+  // Images/PDFs -> OpenCode file parts (remote URLs downloaded here, before any new session exists).
+  let fileParts;
+  try {
+    const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(60_000)]);
+    fileParts = await Promise.all(send.files.map((f, i) => resolveFile(f, i, signal)));
+  } catch (e) {
+    if (reused) deleteSession(reused.sessionID, dir);
+    if (clientGone) return log('chat cancelled by client during file download');
+    return oaiError(res, e.status || 400, e.status ? e.message : 'Could not download an attached file');
+  }
+  if (clientGone) {
+    if (reused) deleteSession(reused.sessionID, dir);
+    return log('chat cancelled by client before start');
+  }
+
+  let sessionID;
+  if (reused) {
+    sessionID = reused.sessionID;
+  } else {
+    let s;
+    try {
+      s = await oc('POST', withDir('/session', dir), { title: `openai-compat ${new Date().toISOString()}` }, AbortSignal.any([ac.signal, AbortSignal.timeout(30_000)]));
+    } catch (e) {
+      if (clientGone) return log('chat cancelled by client during session create');
+      return oaiError(res, 502, `Could not create OpenCode session (${e.message})`, 'api_error');
+    }
+    if (s.status !== 200 || !s.json || !s.json.id) return oaiError(res, 502, `Could not create OpenCode session (${s.status})`, 'api_error');
+    sessionID = s.json.id;
+    countSession();
+  }
+  res.setHeader('x-opencode-session-reused', reused ? 'true' : 'false');
   const started = Date.now();
   if (clientGone) {
-    if (!KEEP_SESSIONS) oc('DELETE', withDir(`/session/${sessionID}`, dir)).catch(() => {});
+    deleteSession(sessionID, dir);
     return log(`chat ${sessionID} cancelled by client before prompt`);
   }
   const timer = setTimeout(() => { timedOut = true; ac.abort(); }, TIMEOUT_MS);
@@ -409,7 +496,7 @@ async function handleChat(req, res) {
   // STREAM_OPEN_DELAY_MS (buffered mode opens at once). Until then errors can still
   // be sent as real HTTP statuses. Once open, keep-alive comments fill silent gaps.
   const live = stream && !BUFFER_STREAM;
-  const id = `chatcmpl-${sessionID}`;
+  const id = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
   let opened = false;
   let lastWrite = 0;
   let keepalive, openTimer;
@@ -454,12 +541,14 @@ async function handleChat(req, res) {
   const parts = new Map();   // partID -> { type, messageID }
   const sent = new Map();    // partID -> characters already sent
   let streamedText = false;
+  let streamedContent = ''; // exactly what the client received as `content`
   const emit = (partID, type, text) => {
     if (!text || clientGone) return;
     if (type === 'text') {
       const sep = !sent.has(partID) && streamedText ? '\n\n' : '';
       open();
       chunk({ content: sep + text });
+      streamedContent += sep + text;
       streamedText = true;
     } else {
       open();
@@ -469,7 +558,12 @@ async function handleChat(req, res) {
   };
   const forward = (ev) => {
     const p = ev.properties || {};
-    if (ev.type === 'message.updated' && p.info) { roles.set(p.info.id, p.info.role); return; }
+    // A reused session also has the earlier turns' messages: only follow ones created for this prompt.
+    if (ev.type === 'message.updated' && p.info) {
+      const old = p.info.time && typeof p.info.time.created === 'number' && p.info.time.created < started - 1000;
+      roles.set(p.info.id, old ? 'earlier' : p.info.role);
+      return;
+    }
     if (ev.type === 'message.part.updated' && p.part) {
       const part = p.part;
       parts.set(part.id, { type: part.type, messageID: part.messageID });
@@ -517,8 +611,9 @@ async function handleChat(req, res) {
     clearTimeout(openTimer);
     stopWatching();
     if (keepalive) clearInterval(keepalive);
-    if (!KEEP_SESSIONS) oc('DELETE', withDir(`/session/${sessionID}`, dir)).catch(() => {});
   };
+  // Any failure leaves the session's state unknown, so it is never reused.
+  const drop = () => deleteSession(sessionID, dir);
 
   // Subscribe before prompting so no early text or retry status is missed.
   await stopWatching.connected;
@@ -530,8 +625,8 @@ async function handleChat(req, res) {
       'POST',
       withDir(`/session/${sessionID}/message`, dir),
       {
-        parts: [{ type: 'text', text: prompt.text }, ...fileParts],
-        ...(prompt.system ? { system: prompt.system } : {}),
+        parts: [{ type: 'text', text: send.text }, ...fileParts],
+        ...(send.system ? { system: send.system } : {}),
         ...(model ? { model } : {}),
         ...(agent ? { agent } : {}),
       },
@@ -540,6 +635,7 @@ async function handleChat(req, res) {
   } catch (e) {
     await oc('POST', withDir(`/session/${sessionID}/abort`, dir)).catch(() => {});
     cleanup();
+    drop();
     if (clientGone) return log(`chat ${sessionID} cancelled by client`);
     if (rateLimited) {
       const when = new Date(Date.now() + rateLimited.retryAfter * 1000).toISOString();
@@ -560,10 +656,11 @@ async function handleChat(req, res) {
   if (r.status === 200) {
     try {
       const m = await oc('GET', withDir(`/session/${sessionID}/message`, dir), undefined, AbortSignal.timeout(5000));
-      if (m.status === 200 && Array.isArray(m.json)) allTokens = m.json.filter((x) => x.info && x.info.role === 'assistant').map((x) => x.info.tokens || {});
+      if (m.status === 200 && Array.isArray(m.json)) allTokens = m.json.filter((x) => x.info && x.info.role === 'assistant' && !(x.info.time && x.info.time.created < started - 1000)).map((x) => x.info.tokens || {});
     } catch {}
   }
   cleanup();
+  if (r.status !== 200 || !(r.json && r.json.info) || (r.json.info.error && r.json.info.error.name !== 'MessageOutputLengthError')) drop();
 
   // Upstream problems are always 502: a 401/4xx from us would read as "your request or key is wrong".
   const info = r.json && r.json.info;
@@ -589,14 +686,19 @@ async function handleChat(req, res) {
   usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
   const modelName = info.providerID && info.modelID ? `${info.providerID}/${info.modelID}` : body.model || 'default';
 
-  log(`chat ${sessionID} ok model=${modelName} ${Date.now() - started}ms`);
+  // Safety net: send any part of the final answer the event stream did not deliver.
+  if (live) for (const p of finalText) emit(p.id, 'text', p.text.slice(sent.get(p.id) || 0));
+
+  // Remember the conversation as the client will send it next time: its messages plus
+  // exactly the reply text it received.
+  const received = live ? streamedContent : content;
+  if (REUSE_SESSIONS && !clientGone) storeConversation(fingerprint(cred, [...body.messages, { role: 'assistant', content: received }]), { sessionID, dir });
+  else drop();
+  log(`chat ${sessionID} ok model=${modelName} ${Date.now() - started}ms reused=${!!reused} sessions=${stats.sessionsCreated} today=${stats.sessionsToday} requests=${stats.requests} open=${conversations.size}`);
 
   if (stream) {
-    if (live) {
-      // Safety net: send any part of the final answer the event stream did not deliver.
-      for (const p of finalText) emit(p.id, 'text', p.text.slice(sent.get(p.id) || 0));
-      open();
-    } else if (content) chunk({ content });
+    if (live) open();
+    else if (content) chunk({ content });
     chunk({}, finish_reason);
     if (includeUsage) write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: modelName, choices: [], usage })}\n\n`);
     write('data: [DONE]\n\n');
@@ -698,7 +800,7 @@ const server = http.createServer(async (req, res) => {
   // CORS for /v1 so browser clients (e.g. a page opened from disk) can call it.
   // Bearer auth is still required on every real request; preflights carry no credentials.
   res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-expose-headers', 'retry-after');
+  res.setHeader('access-control-expose-headers', 'retry-after, x-opencode-session, x-opencode-session-reused');
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-methods': 'GET, POST, OPTIONS',
@@ -786,7 +888,10 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     stopping = true;
     log(`${sig} received, shutting down`);
     server.close();
-    child.kill(sig);
+    // Delete the kept conversation sessions first (at most 2 s), then stop OpenCode.
+    const pending = [...conversations.values()].map((e) => deleteSession(e.sessionID, e.dir));
+    conversations.clear();
+    Promise.race([Promise.all(pending), new Promise((r) => setTimeout(r, 2000))]).then(() => child.kill(sig));
     // OpenCode normally exits within a second; occasionally it lingers. Its
     // SQLite store is crash-safe, so escalate rather than wait for the
     // platform to kill the whole container.
@@ -820,7 +925,14 @@ waitForOpenCode().then((ok) => {
     child.kill('SIGKILL');
     process.exit(1);
   }
-  server.listen(PORT, '0.0.0.0', () => {
+  // Sessions this adapter kept before a crash or hard stop are unreachable now (the
+  // conversation map lives in memory), so remove them before taking requests.
+  const removeLeftovers = KEEP_SESSIONS ? Promise.resolve() : oc('GET', withDir('/session', DEFAULT_DIR), undefined, AbortSignal.timeout(10_000)).then((r) => {
+    const stale = (Array.isArray(r.json) ? r.json : []).filter((x) => x && typeof x.title === 'string' && x.title.startsWith('openai-compat '));
+    if (stale.length) log(`removing ${stale.length} leftover API session(s)`);
+    return Promise.all(stale.map((x) => deleteSession(x.id, DEFAULT_DIR)));
+  }).catch(() => {});
+  removeLeftovers.then(() => server.listen(PORT, '0.0.0.0', () => {
     log(`listening on 0.0.0.0:${PORT}  (OpenAI-compatible /v1 + proxy to OpenCode on 127.0.0.1:${UP_PORT})`);
-  });
+  }));
 });

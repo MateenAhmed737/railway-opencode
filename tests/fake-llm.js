@@ -14,10 +14,12 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR
 const seen = [];
 // Chat requests currently open, and the most ever open at once (served at /inflight).
 let inflight = 0, maxInflight = 0;
-const BASH = 'echo LEAK:$OPENCODE_SERVER_PASSWORD; echo LEAK:$OPENCODE_SERVER_PASSWORD > /data/workspace/leak.txt';
+// Tries every way the tool could reach the public secrets: its own env, and every readable /proc/<pid>/environ.
+// (The /proc path is built in a variable, as an attacker would, so OpenCode's path check doesn't stop it first.)
+const BASH = 'echo LEAK:$OPENCODE_SERVER_PASSWORD; echo LEAK:$OPENAI_COMPAT_API_KEY; d=/pr; d=${d}oc; for f in $d/[0-9]*/environ; do tr "\\0" "\\n" < $f 2>/dev/null; done | grep -i pass';
 
-function respondToolCall(res, body) {
-  const call = { index: 0, id: 'call_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: BASH, description: 'test' }) } };
+function respondToolCall(res, body, command = BASH) {
+  const call = { index: 0, id: 'call_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command, description: 'test' }) } };
   if (body.stream) {
     const base = { id: 'fake', object: 'chat.completion.chunk', created: 0, model: 'echo' };
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -95,6 +97,11 @@ http
       seen.push({ prompt: lastUser ? text(lastUser).slice(-80) : '', tools: (body.tools || []).length, toolResult: toolResult ? text(toolResult).slice(0, 200) : null });
       // "TOOLCALL" asks for a bash call that would print and save the server password;
       // once a tool result comes back, the reply repeats it.
+      // "TOOLEXT" asks for a command outside the project, which makes OpenCode ask for permission.
+      if (reply.includes('TOOLEXT')) {
+        if (!toolResult) return respondToolCall(res, body, 'cat /etc/hostname');
+        return respond(res, body, `${reply} TOOL-OUTPUT: ${text(toolResult)}`);
+      }
       if (reply.includes('TOOLCALL')) {
         if (!toolResult) return respondToolCall(res, body);
         return respond(res, body, `${reply} TOOL-OUTPUT: ${text(toolResult)}`);

@@ -27,10 +27,15 @@ const UP_PORT = int(env.OPENCODE_INTERNAL_PORT, 4097);
 const USER = env.OPENCODE_SERVER_USERNAME || 'opencode';
 const PASS = env.OPENCODE_SERVER_PASSWORD || '';
 const API_KEY = env.OPENAI_COMPAT_API_KEY || PASS;
+// OpenCode itself gets a random password that only this process knows. The public
+// password and API key are checked here and never passed to OpenCode, so the agent's
+// tools (bash etc.) can't read them from its environment.
+const INTERNAL_PASS = crypto.randomBytes(32).toString('base64url');
 const DEFAULT_DIR = env.OPENAI_COMPAT_DIRECTORY || env.WORKSPACE_DIR || '/data/workspace';
-// /v1 uses a tool-free "chat" agent by default. With a tool-using agent (e.g. `build`),
-// the /v1 key is effectively shell access to the container, including its secrets.
-const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || 'chat';
+// /v1 uses OpenCode's default agent unless set. OpenCode's free models only answer requests
+// from its own coding agent, so the default keeps them working; the price is that the /v1
+// key can run commands in the container. `chat` is a built-in tool-free alternative.
+const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || '';
 // Let callers pick agent/directory with x-opencode-agent / x-opencode-directory headers.
 const ALLOW_OVERRIDES = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_ALLOW_OVERRIDES || '');
 const CHAT_AGENT = { mode: 'primary', description: 'Plain chat, no tools', prompt: 'You are a helpful assistant.', permission: { '*': 'deny' } };
@@ -51,7 +56,7 @@ const FILE_MIME = /^(image\/(png|jpe?g|gif|webp)|application\/pdf)$/i;
 const ALLOW_REMOTE_FILES = !/^(0|false|no)$/i.test(env.OPENAI_COMPAT_ALLOW_REMOTE_IMAGES || '');
 const PRIVATE_HOST_ALLOWLIST = new Set((env.OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean));
 const MAX_REDIRECTS = 3;
-const UP_AUTH = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
+const UP_AUTH = 'Basic ' + Buffer.from(`${USER}:${INTERNAL_PASS}`).toString('base64');
 
 if (!PASS) {
   console.error('[adapter] OPENCODE_SERVER_PASSWORD is required');
@@ -485,6 +490,13 @@ async function handleChat(req, res) {
   let rateLimited = null;
   let watcherLost = false;
   const stopWatching = watchSession(sessionID, dir, (ev) => {
+    // Nobody can answer a permission prompt through /v1, so reject it at once
+    // (the model is told and carries on) instead of waiting for the timeout.
+    if (ev.type === 'permission.asked' && ev.properties.id) {
+      log(`chat ${sessionID} rejected permission request: ${ev.properties.permission || '?'}`);
+      oc('POST', withDir(`/permission/${encodeURIComponent(ev.properties.id)}/reply`, dir), { reply: 'reject', message: 'Permission requests are rejected for API requests.' }).catch(() => {});
+      return;
+    }
     if (live && !rateLimited) forward(ev);
     if (ev.type !== 'session.status' || !ev.properties.status || ev.properties.status.type !== 'retry') return;
     const st = ev.properties.status;
@@ -617,9 +629,28 @@ function forwardedHeaders(req) {
   return h;
 }
 
+/** Web UI and native API: Basic auth with the public username and password, checked here. */
+function basicAuthorized(req) {
+  const h = req.headers.authorization || '';
+  if (!/^basic /i.test(h)) return false;
+  const raw = Buffer.from(h.slice(6).trim(), 'base64').toString('utf8');
+  const i = raw.indexOf(':');
+  if (i < 0) return false;
+  const userOk = safeEqual(raw.slice(0, i), USER);
+  const passOk = safeEqual(raw.slice(i + 1), PASS);
+  return userOk && passOk;
+}
+const BASIC_CHALLENGE = 'Basic realm="OpenCode", charset="UTF-8"';
+
 function proxy(req, res) {
+  if (!basicAuthorized(req)) {
+    res.writeHead(401, { 'www-authenticate': BASIC_CHALLENGE, 'content-type': 'text/plain' });
+    return res.end('Unauthorized\n');
+  }
+  const headers = forwardedHeaders(req);
+  headers.authorization = UP_AUTH; // swap the public credentials for OpenCode's internal ones
   const up = http.request(
-    { host: '127.0.0.1', port: UP_PORT, method: req.method, path: req.url, headers: forwardedHeaders(req) },
+    { host: '127.0.0.1', port: UP_PORT, method: req.method, path: req.url, headers },
     (ur) => {
       res.writeHead(ur.statusCode, ur.statusMessage, ur.headers);
       res.flushHeaders();
@@ -635,9 +666,16 @@ function proxy(req, res) {
 }
 
 function proxyUpgrade(req, socket, head) {
+  if (!basicAuthorized(req)) {
+    socket.end(`HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: ${BASIC_CHALLENGE}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+    return;
+  }
   const up = net.connect(UP_PORT, '127.0.0.1', () => {
     let s = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
-    for (let i = 0; i < req.rawHeaders.length; i += 2) s += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i];
+      s += `${name}: ${name.toLowerCase() === 'authorization' ? UP_AUTH : req.rawHeaders[i + 1]}\r\n`;
+    }
     up.write(s + '\r\n');
     if (head && head.length) up.write(head);
     up.pipe(socket);
@@ -694,21 +732,43 @@ server.keepAliveTimeout = 65_000;
 // on top of the global opencode.json, so the user's own config and agents still apply;
 // a "chat" agent defined in an existing OPENCODE_CONFIG_CONTENT wins over ours.
 function childEnv() {
+  // OpenCode never sees the public password or the API key, only its internal password.
+  const out = { ...env, OPENCODE_SERVER_USERNAME: USER, OPENCODE_SERVER_PASSWORD: INTERNAL_PASS };
+  delete out.OPENAI_COMPAT_API_KEY;
   let cfg = {};
   if (env.OPENCODE_CONFIG_CONTENT) {
     try { cfg = JSON.parse(env.OPENCODE_CONFIG_CONTENT); } catch {
       log('OPENCODE_CONFIG_CONTENT is not valid JSON; passing it through unchanged (no built-in chat agent)');
-      return env;
+      return out;
     }
   }
   cfg.agent = { chat: CHAT_AGENT, ...(cfg.agent || {}) };
-  return { ...env, OPENCODE_CONFIG_CONTENT: JSON.stringify(cfg) };
+  out.OPENCODE_CONFIG_CONTENT = JSON.stringify(cfg);
+  return out;
+}
+
+// Started as root by the entrypoint: run OpenCode as APP_USER, then drop this process to
+// APP_USER as well. Changing user marks the process non-dumpable, so its /proc/<pid>/environ
+// and memory (which still hold the public password) can't be read by OpenCode's tools.
+let runAs = null;
+if (process.getuid && process.getuid() === 0) {
+  const name = env.APP_USER || 'opencode';
+  const id = (flag) => Number(require('node:child_process').execFileSync('id', [flag, name]).toString().trim());
+  runAs = { uid: id('-u'), gid: id('-g') };
+} else {
+  log('not started as root: the agent runs as the same user as this process and could read the public password from /proc');
 }
 
 const child = spawn('opencode', ['web', '--hostname', '127.0.0.1', '--port', String(UP_PORT), ...process.argv.slice(2)], {
   stdio: 'inherit',
   env: childEnv(),
+  ...(runAs || {}),
 });
+if (runAs) {
+  process.setgroups([runAs.gid]);
+  process.setgid(runAs.gid);
+  process.setuid(runAs.uid);
+}
 child.on('error', (e) => { log('failed to start opencode:', e.message); process.exit(1); });
 let stopping = false;
 child.on('exit', (code, signal) => {

@@ -2,7 +2,7 @@
 /*
  * OpenAI-compatible front door for OpenCode.
  *
- *   public :$PORT ──▶ this process ──▶ opencode web on 127.0.0.1:$OPENCODE_INTERNAL_PORT
+ *   public :$PORT â”€â”€â–¶ this process â”€â”€â–¶ opencode web on 127.0.0.1:$OPENCODE_INTERNAL_PORT
  *
  *   GET  /v1/models            -> models from OpenCode's configured providers
  *   POST /v1/chat/completions  -> one OpenCode session + message per request
@@ -25,7 +25,12 @@ const USER = env.OPENCODE_SERVER_USERNAME || 'opencode';
 const PASS = env.OPENCODE_SERVER_PASSWORD || '';
 const API_KEY = env.OPENAI_COMPAT_API_KEY || PASS;
 const DEFAULT_DIR = env.OPENAI_COMPAT_DIRECTORY || env.WORKSPACE_DIR || '/data/workspace';
-const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || '';
+// /v1 uses a tool-free "chat" agent by default. With a tool-using agent (e.g. `build`),
+// the /v1 key is effectively shell access to the container, including its secrets.
+const DEFAULT_AGENT = env.OPENAI_COMPAT_AGENT || 'chat';
+// Let callers pick agent/directory with x-opencode-agent / x-opencode-directory headers.
+const ALLOW_OVERRIDES = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_ALLOW_OVERRIDES || '');
+const CHAT_AGENT = { mode: 'primary', description: 'Plain chat, no tools', prompt: 'You are a helpful assistant.', permission: { '*': 'deny' } };
 const KEEP_SESSIONS = /^(1|true|yes)$/i.test(env.OPENAI_COMPAT_KEEP_SESSIONS || '');
 const TIMEOUT_MS = int(env.OPENAI_COMPAT_TIMEOUT_SECONDS, 600) * 1000;
 // If OpenCode schedules a provider retry further out than this, fail fast with 429.
@@ -298,7 +303,7 @@ function errorMessage(err) {
 // ---------------------------------------------------------------- routes ----
 
 async function listModels(req, res) {
-  const dir = req.headers['x-opencode-directory'] || DEFAULT_DIR;
+  const dir = (ALLOW_OVERRIDES && req.headers['x-opencode-directory']) || DEFAULT_DIR;
   const r = await oc('GET', withDir('/config/providers', dir));
   if (r.status !== 200 || !r.json) return oaiError(res, 502, `OpenCode returned ${r.status}`, 'api_error');
   const data = [];
@@ -335,8 +340,8 @@ async function chatCompletions(req, res) {
     return oaiError(res, e.status || 400, e.message);
   }
 
-  const dir = req.headers['x-opencode-directory'] || DEFAULT_DIR;
-  const agent = req.headers['x-opencode-agent'] || DEFAULT_AGENT;
+  const dir = (ALLOW_OVERRIDES && req.headers['x-opencode-directory']) || DEFAULT_DIR;
+  const agent = (ALLOW_OVERRIDES && req.headers['x-opencode-agent']) || DEFAULT_AGENT;
   const stream = body.stream === true;
   const includeUsage = !!(body.stream_options && body.stream_options.include_usage);
   const created = Math.floor(Date.now() / 1000);
@@ -631,9 +636,24 @@ server.keepAliveTimeout = 65_000;
 
 // ---------------------------------------------------------------- supervisor
 
+// Add the tool-free "chat" agent to OpenCode's config. OPENCODE_CONFIG_CONTENT is merged
+// on top of the global opencode.json, so the user's own config and agents still apply;
+// a "chat" agent defined in an existing OPENCODE_CONFIG_CONTENT wins over ours.
+function childEnv() {
+  let cfg = {};
+  if (env.OPENCODE_CONFIG_CONTENT) {
+    try { cfg = JSON.parse(env.OPENCODE_CONFIG_CONTENT); } catch {
+      log('OPENCODE_CONFIG_CONTENT is not valid JSON; passing it through unchanged (no built-in chat agent)');
+      return env;
+    }
+  }
+  cfg.agent = { chat: CHAT_AGENT, ...(cfg.agent || {}) };
+  return { ...env, OPENCODE_CONFIG_CONTENT: JSON.stringify(cfg) };
+}
+
 const child = spawn('opencode', ['web', '--hostname', '127.0.0.1', '--port', String(UP_PORT), ...process.argv.slice(2)], {
   stdio: 'inherit',
-  env,
+  env: childEnv(),
 });
 child.on('error', (e) => { log('failed to start opencode:', e.message); process.exit(1); });
 let stopping = false;

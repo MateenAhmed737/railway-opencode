@@ -158,7 +158,8 @@ Set these in **Service → Variables**:
 | `OPENCODE_SERVER_USERNAME` | no | Defaults to `opencode` |
 | `OPENAI_COMPAT_API_KEY` | no | Separate Bearer key for `/v1`. Defaults to `OPENCODE_SERVER_PASSWORD`. Set it to give API clients a key that can't log in to the web UI |
 | `OPENAI_COMPAT_ENABLED` | no | `true` (default). `false` removes the adapter and OpenCode listens on `$PORT` directly |
-| `OPENAI_COMPAT_AGENT` | no | OpenCode agent for `/v1` requests (e.g. `build`, `plan`). Empty = OpenCode's default |
+| `OPENAI_COMPAT_AGENT` | no | OpenCode agent for `/v1` requests. Default `chat`: a built-in agent with no tools. `build` gives `/v1` full tool access (see the warning in section 9) |
+| `OPENAI_COMPAT_ALLOW_OVERRIDES` | no | `true` lets callers choose the agent and project folder with the `x-opencode-agent` / `x-opencode-directory` headers. Default: the headers are ignored |
 | `OPENAI_COMPAT_DIRECTORY` | no | Project directory for `/v1` requests. Default `/data/workspace` |
 | `OPENAI_COMPAT_TIMEOUT_SECONDS` | no | Max time per `/v1` request. Default `600` |
 | `OPENAI_COMPAT_KEEP_SESSIONS` | no | `true` keeps each `/v1` request's session visible in the web UI. Default: they're deleted afterwards |
@@ -302,7 +303,8 @@ Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1"
 **How a request is handled, and what that means for you:**
 
 - Each request creates a new OpenCode session, sends one prompt, returns the final answer text, and then deletes the session. Set `OPENAI_COMPAT_KEEP_SESSIONS=true` to keep sessions so you can inspect them in the web UI. The session ID is returned in the `x-opencode-session` response header.
-- **It's the agent, not a bare model.** OpenCode may read files, run commands and edit code in the project directory before it answers. The response contains only the final text. Pick a different project folder per request with the header `x-opencode-directory: /data/workspace/my-repo`, and a different agent with `x-opencode-agent: plan`.
+- **Plain chat by default, no tools.** `/v1` uses a built-in `chat` agent whose permissions deny every tool, so the model can't read files or run commands, and the request stays small (no OpenCode system prompt or tool definitions). The adapter adds this agent through `OPENCODE_CONFIG_CONTENT`, which OpenCode merges on top of your `opencode.json`; define your own `chat` agent there to change it.
+- **Using the coding agent through `/v1` is opt-in, and then the key equals shell access.** Set `OPENAI_COMPAT_AGENT=build` (or another tool-using agent) to let `/v1` read files, run commands and edit code in the project directory. Anyone with the `/v1` key can then run any command in the container, including reading `OPENCODE_SERVER_PASSWORD` from its environment, so a separate `OPENAI_COMPAT_API_KEY` no longer protects the web UI. The `x-opencode-agent` and `x-opencode-directory` request headers are ignored unless you set `OPENAI_COMPAT_ALLOW_OVERRIDES=true`.
 - `system`/`developer` messages become OpenCode's system prompt. Earlier user/assistant turns are flattened into a transcript inside the new prompt, because OpenCode sessions can't be pre-filled with assistant turns.
 - **Streaming is buffered.** With `"stream": true` you get a valid SSE response (role chunk, keep-alive comments every 15 s, then the full answer, then `[DONE]`), but the text arrives in one chunk when OpenCode finishes, not token by token. `stream_options.include_usage` is supported.
 - **Images and PDFs are supported** in user messages, using standard OpenAI content parts:
@@ -394,4 +396,4 @@ Change `ARG OPENCODE_VERSION` in the `Dockerfile`, run both test suites, then pu
 - OpenCode listens on `127.0.0.1` only. Every public request passes through the adapter, and every route needs credentials: `/v1/*` checks the Bearer key (constant-time compare), and everything else is checked by OpenCode's own Basic auth.
 - No credentials are in the image or the repo. The password is never logged (both test suites check this).
 - TLS is terminated by Railway's edge.
-- Anyone with the password **or the `/v1` key** can make OpenCode run shell commands in the container. Treat both like SSH keys: use long random values, give API clients a separate `OPENAI_COMPAT_API_KEY`, and rotate by changing the variable and redeploying.
+- Anyone with the password can make OpenCode run shell commands in the container. With the default `chat` agent the `/v1` key can't: it only gets model replies. If you set `OPENAI_COMPAT_AGENT` to a tool-using agent such as `build`, the `/v1` key also equals shell access and can read the password. Treat both like SSH keys: use long random values, give API clients a separate `OPENAI_COMPAT_API_KEY`, and rotate by changing the variable and redeploying.

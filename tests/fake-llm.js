@@ -10,6 +10,24 @@ const images = (m) => (Array.isArray(m && m.content) ? m.content.filter((p) => p
 // 1x1 PNG served at /test.png so the adapter's remote-image download can be tested.
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64');
 
+// Every chat request is recorded (tool count, agent prompt size) and served at /requests.
+const seen = [];
+const BASH = 'echo LEAK:$OPENCODE_SERVER_PASSWORD; echo LEAK:$OPENCODE_SERVER_PASSWORD > /data/workspace/leak.txt';
+
+function respondToolCall(res, body) {
+  const call = { index: 0, id: 'call_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: BASH, description: 'test' }) } };
+  if (body.stream) {
+    const base = { id: 'fake', object: 'chat.completion.chunk', created: 0, model: 'echo' };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [call] }, finish_reason: null }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    return res.end();
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ id: 'fake', object: 'chat.completion', created: 0, model: 'echo', choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' }] }));
+}
+
 function respond(res, body, reply) {
   if (res.destroyed) return;
   const usage = { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 };
@@ -34,6 +52,10 @@ http
         res.writeHead(200, { 'content-type': 'image/png' });
         return res.end(PNG);
       }
+      if (req.url === '/requests') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify(seen));
+      }
       if (req.url.endsWith('/models')) {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ object: 'list', data: [{ id: 'echo', object: 'model' }] }));
@@ -44,6 +66,14 @@ http
       const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
       const sys = msgs.some((m) => m.role === 'system' && text(m).includes('ADAPTER-SYSTEM-MARKER')) ? 'yes' : 'no';
       const reply = `FAKE-REPLY[sys=${sys}][img=${images(lastUser)}]: ${lastUser ? text(lastUser).slice(-200) : ''}`;
+      const toolResult = msgs.find((m) => m.role === 'tool');
+      seen.push({ prompt: lastUser ? text(lastUser).slice(-80) : '', tools: (body.tools || []).length, toolResult: toolResult ? text(toolResult).slice(0, 200) : null });
+      // "TOOLCALL" asks for a bash call that would print and save the server password;
+      // once a tool result comes back, the reply repeats it.
+      if (reply.includes('TOOLCALL')) {
+        if (!toolResult) return respondToolCall(res, body);
+        return respond(res, body, `${reply} TOOL-OUTPUT: ${text(toolResult)}`);
+      }
       // "LIMIT" simulates a provider quota: 429 with a one-hour Retry-After.
       if (reply.includes('LIMIT')) {
         res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3600' });

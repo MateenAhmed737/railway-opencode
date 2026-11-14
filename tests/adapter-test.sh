@@ -27,7 +27,7 @@ docker network create "$NET" >/dev/null
 docker run -d --name "$LLM" --network "$NET" -v "$SRC:/fake-llm.js:ro" --entrypoint node "$IMAGE" /fake-llm.js >/dev/null
 CFG="{\"provider\":{\"fake\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Fake\",\"options\":{\"baseURL\":\"http://${LLM}:9000/v1\",\"apiKey\":\"x\"},\"models\":{\"echo\":{\"name\":\"Echo\",\"attachment\":true,\"modalities\":{\"input\":[\"text\",\"image\"],\"output\":[\"text\"]}}}}},\"model\":\"fake/echo\"}"
 docker run -d --name "$NAME" --network "$NET" -e PORT="$PORT" -e OPENCODE_SERVER_PASSWORD="$KEY" \
-  -e OPENCODE_CONFIG_CONTENT="$CFG" -e OPENAI_COMPAT_TIMEOUT_SECONDS=3 -p "${PORT}:${PORT}" "$IMAGE" >/dev/null
+  -e OPENCODE_CONFIG_CONTENT="$CFG" -e OPENAI_COMPAT_TIMEOUT_SECONDS=3 -e OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST="$LLM" -p "${PORT}:${PORT}" "$IMAGE" >/dev/null
 for _ in $(seq 1 60); do curl -sf -o /dev/null -u "opencode:${KEY}" "${BASE}/global/health" && break; sleep 1; done
 expect "server up" '"healthy":true' "$(curl -s -u "opencode:${KEY}" "${BASE}/global/health")"
 
@@ -52,6 +52,31 @@ expect "stream ends with [DONE]" 'data: [DONE]' "$R"
 expect "default model when omitted" 'FAKE-REPLY' "$(chat '{"messages":[{"role":"user","content":"x"}]}')"
 expect "content parts array accepted" 'FAKE-REPLY[sys=no][img=0]: partsok' "$(chat '{"messages":[{"role":"user","content":[{"type":"text","text":"parts"},{"type":"text","text":"ok"}]}]}')"
 
+echo "== secrets out of the agent's reach"
+# The default agent has tools. The fake model makes it run bash that prints the
+# password env vars and every readable /proc/<pid>/environ; none may hold the key.
+TC='{"model":"fake/echo","messages":[{"role":"user","content":"TOOLCALL print the password"}]}'
+R="$(chat "$TC")"
+SEEN="$(docker exec "$NAME" curl -s "http://${LLM}:9000/requests")"
+expect "the bash tool really ran" '"toolResult":"LEAK:' "$SEEN"
+expect "tool output holds no public password or key" 'clean' "$( [[ "$SEEN" == *"$KEY"* ]] && echo leaked || echo clean)"
+expect "reply holds no public password or key" 'clean' "$( [[ "$R" == *"$KEY"* ]] && echo leaked || echo clean)"
+APID="$(docker exec "$NAME" pgrep -f openai-adapter/server.js | head -1)"
+expect "adapter environ unreadable by the opencode user" 'denied' "$(docker exec -u opencode "$NAME" sh -c "cat /proc/${APID}/environ >/dev/null 2>&1 && echo readable || echo denied")"
+expect "adapter runs as opencode, not root" 'opencode' "$(docker exec "$NAME" ps -o user= -p "$APID" | tr -d ' ')"
+expect "chat agent stays available" '"name":"chat"' "$(curl -s -u "opencode:${KEY}" "${BASE}/agent")"
+R="$(curl -s -m 30 -w ' HTTP%{http_code}' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"fake/echo","messages":[{"role":"user","content":"TOOLEXT read a file outside"}]}')"
+expect "permission prompt is rejected, not left hanging" 'HTTP200' "$R"
+expect "adapter logged the rejected permission" 'rejected permission request' "$(docker logs "$NAME" 2>&1)"
+expect "web UI refuses the internal-only login" 401 "$(code -u "opencode:wrong" "${BASE}/")"
+
+echo "== usage and upstream errors"
+expect "usage sums every model call of a run" '"total_tokens":36' "$(chat "$TC")"
+R="$(curl -s -m 30 -w ' HTTP%{http_code}' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"fake/echo","messages":[{"role":"user","content":"AUTHFAIL"}]}')"
+expect "provider auth failure -> 502, not 401" 'HTTP502' "$R"
+expect "provider auth failure keeps OpenCode's error code" '"code":"APIError"' "$R"
+expect "unknown model -> 502 api_error" 'HTTP502' "$(curl -s -m 30 -w ' HTTP%{http_code}' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"fake/nope","messages":[{"role":"user","content":"x"}]}')"
+
 echo "== images"
 PNG='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
 expect "data: URL image reaches model" '[img=1]: look' "$(chat "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"${PNG}\"}}]}]}")"
@@ -60,10 +85,48 @@ expect "two images in one message" '[img=2]' "$(chat "{\"model\":\"fake/echo\",\
 expect "svg rejected -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/svg+xml;base64,PHN2Zy8+"}}]}]}')"
 expect "non-image download -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/v1/models\"}}]}]}")"
 expect "file:// url rejected -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///etc/passwd"}}]}]}')"
+img() { curl -s -m 60 -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"$1\"}}]}]}"; }
+GENERIC="$(img 'http://127.0.0.1:4097/global/health')"
+expect "loopback image URL -> 400" 'could not download the image URL' "$GENERIC"
+for u in 'http://localhost:4097/' 'http://169.254.169.254/latest/meta-data/' 'http://10.0.0.1/x.png' 'http://[::1]:4097/' "http://${LLM}:9000/to-loopback.png"; do
+  [[ "$(img "$u")" == "$GENERIC" ]] && pass "same generic 400 for $u" || fail "different reply for $u: $(img "$u" | head -c 200)"
+done
+START=$(date +%s)
+expect "300 MB image cut off -> 400" 'could not download the image URL' "$(img "http://${LLM}:9000/big.png")"
+(( $(date +%s) - START < 20 )) && pass "oversized download aborted in $(( $(date +%s) - START ))s" || fail "oversized download took $(( $(date +%s) - START ))s"
+PEAK="$(docker exec "$NAME" sh -c 'grep VmHWM /proc/$(pgrep -f openai-adapter/server.js | head -1)/status' | awk '{print $2}')"
+(( ${PEAK:-0} > 0 && PEAK < 150 * 1024 )) && pass "adapter peak memory stayed low ($(( PEAK / 1024 )) MB)" || fail "adapter peak memory ${PEAK:-?} kB"
 expect "audio part -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}')"
+
+echo "== client gone"
+nreq() { docker exec "$NAME" curl -s "http://${LLM}:9000/requests" | grep -o '"prompt"' | wc -l | tr -d ' '; }
+BEFORE="$(nreq)"
+curl -s -m 1 -o /dev/null -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" \
+  -d "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"GONE\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/slow.png\"}}]}]}"
+sleep 4
+expect "client that left during download never reaches the model" "$BEFORE" "$(nreq)"
+expect "no session left behind" '0' "$(curl -s -u "opencode:${KEY}" "${BASE}/session" | grep -o 'openai-compat' | wc -l | tr -d ' ')"
+
+echo "== concurrency"
+for i in $(seq 1 20); do
+  curl -s -m 40 -o /dev/null -w '%{http_code}%header{retry-after}\n' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"SLOW $i\"}]}" > "/tmp/oc-conc-$$-$i" &
+done
+wait
+CODES="$(cat /tmp/oc-conc-$$-* | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"; rm -f /tmp/oc-conc-$$-*
+MAXIN="$(docker exec "$NAME" curl -s "http://${LLM}:9000/inflight" | sed -n 's/.*"max":\([0-9]*\).*/\1/p')"
+(( MAXIN >= 1 && MAXIN <= 4 )) && pass "at most 4 requests reached the model at once (max ${MAXIN}; status codes: ${CODES})" || fail "max ${MAXIN} requests reached the model at once (codes: ${CODES})"
+expect "requests queued over 10 s get 429 with Retry-After: 5" ' 4295' "$CODES"
 
 echo "== errors"
 expect "bad model id -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"echo","messages":[{"role":"user","content":"x"}]}')"
+expect "null body -> 400" 'Body must be a JSON object' "$(chat 'null')"
+expect "array body -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '[1]')"
+expect "non-string model -> clear 400" '`model` must be a string' "$(chat '{"model":5,"messages":[{"role":"user","content":"x"}]}')"
+BIG="/tmp/oc-big-$$.json"; head -c $((27 * 1024 * 1024)) /dev/zero | tr '\0' 'a' | sed 's/^/{"messages":[{"role":"user","content":"/; s/$/"}]}/' > "$BIG"
+BIGARG="$BIG"; command -v cygpath >/dev/null && BIGARG="$(cygpath -m "$BIG")"
+R="$(curl -s -m 60 -w ' HTTP%{http_code}' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' --data-binary "@$BIGARG" "${BASE}/v1/chat/completions")"; rm -f "$BIG"
+expect "27 MB body -> JSON 413" 'HTTP413' "$R"
+expect "413 body is an OpenAI error" '"error"' "$R"
 expect "invalid JSON -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{')"
 expect "unknown /v1 route -> 404 JSON" 'unknown_url' "$(curl -s -H "Authorization: Bearer ${KEY}" "${BASE}/v1/embeddings")"
 START=$(date +%s)

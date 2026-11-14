@@ -2,7 +2,9 @@
 # Entrypoint for the OpenCode Railway container.
 #  1. Refuses to start without OPENCODE_SERVER_PASSWORD.
 #  2. Prepares /data (non-recursive ownership fixes only).
-#  3. Drops to the non-root user and execs `opencode web` on 0.0.0.0:$PORT.
+#  3. Drops to the non-root user and execs the OpenAI adapter on 0.0.0.0:$PORT,
+#     which runs `opencode web` on 127.0.0.1:$OPENCODE_INTERNAL_PORT. With
+#     OPENAI_COMPAT_ENABLED=false it execs `opencode web` on 0.0.0.0:$PORT instead.
 set -Eeuo pipefail
 
 log() { printf '[entrypoint] %s\n' "$*" >&2; }
@@ -91,7 +93,11 @@ if [[ "${OPENAI_COMPAT_ENABLED,,}" =~ ^(1|true|yes)$ ]]; then
   log "  openai api : /v1/models, /v1/chat/completions (Bearer key = $([[ -n "${OPENAI_COMPAT_API_KEY:-}" ]] && echo OPENAI_COMPAT_API_KEY || echo OPENCODE_SERVER_PASSWORD))"
   log "  opencode   : 127.0.0.1:${INTERNAL_PORT} (internal, behind the adapter)"
   # The adapter owns the public port, supervises OpenCode and forwards signals.
-  exec "${RUN_AS[@]}" node /opt/openai-adapter/server.js "$@"
+  # It starts as root (when we are root) only to launch OpenCode as ${APP_USER} with
+  # an internal password, then drops to ${APP_USER} itself before listening. That
+  # keeps the public password and API key out of reach of OpenCode's tools.
+  export APP_USER
+  exec node /opt/openai-adapter/server.js "$@"
 fi
 
 # Adapter disabled: OpenCode owns the public port directly.

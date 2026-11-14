@@ -66,6 +66,9 @@ http
         res.writeHead(302, { location: 'http://127.0.0.1:4097/global/health' });
         return res.end();
       }
+      if (req.url === '/slow.png') {
+        return setTimeout(() => { if (!res.destroyed) { res.writeHead(200, { 'content-type': 'image/png' }); res.end(PNG); } }, 3000);
+      }
       if (req.url === '/requests') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify(seen));

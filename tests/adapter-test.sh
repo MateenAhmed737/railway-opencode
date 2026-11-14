@@ -84,6 +84,15 @@ PEAK="$(docker exec "$NAME" sh -c 'grep VmHWM /proc/$(pgrep -f openai-adapter/se
 (( ${PEAK:-0} > 0 && PEAK < 150 * 1024 )) && pass "adapter peak memory stayed low ($(( PEAK / 1024 )) MB)" || fail "adapter peak memory ${PEAK:-?} kB"
 expect "audio part -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}')"
 
+echo "== client gone"
+nreq() { docker exec "$NAME" curl -s "http://${LLM}:9000/requests" | grep -o '"prompt"' | wc -l | tr -d ' '; }
+BEFORE="$(nreq)"
+curl -s -m 1 -o /dev/null -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" \
+  -d "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"GONE\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/slow.png\"}}]}]}"
+sleep 4
+expect "client that left during download never reaches the model" "$BEFORE" "$(nreq)"
+expect "no session left behind" '0' "$(curl -s -u "opencode:${KEY}" "${BASE}/session" | grep -o 'openai-compat' | wc -l | tr -d ' ')"
+
 echo "== errors"
 expect "bad model id -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"echo","messages":[{"role":"user","content":"x"}]}')"
 expect "invalid JSON -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{')"

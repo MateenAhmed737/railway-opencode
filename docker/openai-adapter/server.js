@@ -378,10 +378,21 @@ async function listModels(req, res) {
 }
 
 async function chatCompletions(req, res) {
+  // One abort path for the whole request: client disconnect, timeout or rate limit.
+  // Registered first, so a client that leaves during body upload, image download or
+  // session creation never gets a model run.
+  const ac = new AbortController();
+  let timedOut = false;
+  let clientGone = false;
+  res.on('close', () => {
+    if (!res.writableFinished) { clientGone = true; ac.abort(); }
+  });
+
   let body;
   try {
     body = JSON.parse(await readBody(req));
   } catch (e) {
+    if (clientGone) return;
     return oaiError(res, e.status || 400, e.status ? e.message : 'Body must be valid JSON');
   }
   if (!Array.isArray(body.messages) || !body.messages.length) return oaiError(res, 400, '`messages` must be a non-empty array');
@@ -397,10 +408,13 @@ async function chatCompletions(req, res) {
   // Images/PDFs -> OpenCode file parts (remote URLs downloaded here, before any session exists).
   let fileParts;
   try {
-    fileParts = await Promise.all(prompt.files.map((f, i) => resolveFile(f, i, AbortSignal.timeout(60_000))));
+    const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(60_000)]);
+    fileParts = await Promise.all(prompt.files.map((f, i) => resolveFile(f, i, signal)));
   } catch (e) {
-    return oaiError(res, e.status || 400, e.message);
+    if (clientGone) return log('chat cancelled by client during file download');
+    return oaiError(res, e.status || 400, e.status ? e.message : 'Could not download an attached file');
   }
+  if (clientGone) return log('chat cancelled by client before start');
 
   const dir = (ALLOW_OVERRIDES && req.headers['x-opencode-directory']) || DEFAULT_DIR;
   const agent = (ALLOW_OVERRIDES && req.headers['x-opencode-agent']) || DEFAULT_AGENT;
@@ -409,18 +423,21 @@ async function chatCompletions(req, res) {
   const created = Math.floor(Date.now() / 1000);
 
   // 1. session
-  const s = await oc('POST', withDir('/session', dir), { title: `openai-compat ${new Date().toISOString()}` });
+  let s;
+  try {
+    s = await oc('POST', withDir('/session', dir), { title: `openai-compat ${new Date().toISOString()}` }, AbortSignal.any([ac.signal, AbortSignal.timeout(30_000)]));
+  } catch (e) {
+    if (clientGone) return log('chat cancelled by client during session create');
+    return oaiError(res, 502, `Could not create OpenCode session (${e.message})`, 'api_error');
+  }
   if (s.status !== 200 || !s.json || !s.json.id) return oaiError(res, 502, `Could not create OpenCode session (${s.status})`, 'api_error');
   const sessionID = s.json.id;
   const started = Date.now();
-
-  const ac = new AbortController();
-  let timedOut = false;
-  let clientGone = false;
+  if (clientGone) {
+    if (!KEEP_SESSIONS) oc('DELETE', withDir(`/session/${sessionID}`, dir)).catch(() => {});
+    return log(`chat ${sessionID} cancelled by client before prompt`);
+  }
   const timer = setTimeout(() => { timedOut = true; ac.abort(); }, TIMEOUT_MS);
-  res.on('close', () => {
-    if (!res.writableFinished) { clientGone = true; ac.abort(); }
-  });
 
   // Streaming. The SSE response is opened lazily: on the first live text, or after
   // STREAM_OPEN_DELAY_MS (buffered mode opens at once). Until then errors can still

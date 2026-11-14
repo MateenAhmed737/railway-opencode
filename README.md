@@ -37,14 +37,16 @@ railway-opencode/
 │   ├── entrypoint.sh           # password guard, /data setup, drop to non-root, start adapter or opencode
 │   ├── healthcheck.sh          # authenticated probe for Docker HEALTHCHECK
 │   └── openai-adapter/
-│       └── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
+│       ├── server.js           # OpenAI-compatible /v1 + proxy + OpenCode supervisor (no npm deps)
+│       └── lib.js              # pure request-parsing and address-check helpers
 ├── railway.json                # build/deploy settings (see the note on Config as Code below)
 ├── examples/
 │   └── pi-models.json          # pi coding agent provider config for the /v1 API
 ├── tests/
 │   ├── smoke-test.sh           # base checks: auth, $PORT, non-root, persistence, shutdown
 │   ├── adapter-test.sh         # OpenAI API checks against a fake model provider
-│   └── fake-llm.js             # tiny OpenAI-style model server used by adapter-test.sh
+│   ├── fake-llm.js             # tiny OpenAI-style model server used by adapter-test.sh
+│   └── unit.test.js            # node:test unit tests for lib.js (node --test tests/unit.test.js)
 └── README.md
 ```
 
@@ -54,7 +56,7 @@ railway-opencode/
   1. exits with an error if `OPENCODE_SERVER_PASSWORD` is empty, so the server never starts without auth;
   2. validates `$PORT` (defaults to `4096` if Railway doesn't set it);
   3. creates the `/data` directories and fixes ownership **only on those directories themselves, and only if wrong**. It never runs `chown -R`. Railway mounts volumes as root, so this step is needed on the first boot;
-  4. drops to the `opencode` user with `gosu` and starts the adapter. The adapter launches `opencode web --hostname 127.0.0.1 --port 4097`, waits until OpenCode reports healthy, and only then opens the public `$PORT`.
+  4. starts the adapter, still as root. The adapter launches `opencode web --hostname 127.0.0.1 --port 4097` as the `opencode` user with a random internal password, then drops to the `opencode` user itself, waits until OpenCode reports healthy, and only then opens the public `$PORT`.
 - **Shutdown.** Railway sends SIGTERM. The adapter stops accepting connections and forwards SIGTERM to OpenCode, which normally exits within a second. If OpenCode is still running after `OPENCODE_SHUTDOWN_GRACE_SECONDS` (default 8), the adapter force-stops it. OpenCode's SQLite store is crash-safe. Either way the container exits with code 143.
 - **Same origin.** Everything is on one port and one domain. OpenCode itself is reachable only on `127.0.0.1` inside the container.
 - **No secrets in the image.** The password and provider credentials are supplied only at runtime.
@@ -107,13 +109,13 @@ Test suites. Both need Docker. On Windows Git Bash, prefix them with `MSYS_NO_PA
 ./tests/smoke-test.sh
 ```
 
-That runs 18 checks: install, password guard, `$PORT`, `0.0.0.0`, non-root, auth on every endpoint, health, writable dirs, graceful shutdown, and persistence across restarts.
+It checks install, password guard, `$PORT`, `0.0.0.0`, non-root, auth on every endpoint, health, writable dirs, graceful shutdown, and persistence across restarts.
 
 ```bash
 ./tests/adapter-test.sh
 ```
 
-That runs 38 checks: `/v1` auth, models, chat, streaming, images (data URLs, downloaded URLs, multiple images, rejected types), error handling, provider rate limits (fast 429), timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
+It checks `/v1` auth, models, chat, streaming, the tool-free default agent, usage, request errors, the concurrency limit, client disconnects, images (data URLs, downloaded URLs, multiple images, rejected types, refused internal URLs, the download size cap), error handling, provider rate limits (fast 429), timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
 
 ## 2. GitHub repository setup
 
@@ -133,7 +135,7 @@ Without the `gh` CLI: create an empty **private** repo on github.com, then run `
 2. Railway detects the `Dockerfile` and builds with it. ("Railway will always build with a Dockerfile if it finds one.")
 3. Before the first deploy succeeds you must add the variables in step 4. Without a password the container exits on purpose, which is expected.
 
-> **Note on `railway.json`.** Railway has deprecated Config as Code. Its docs say *"New services cannot opt into Config as Code"* and existing files stop being read on **2026-12-01**. The included `railway.json` (builder `DOCKERFILE`, restart `ON_FAILURE` with 10 retries) records the intended settings. For a new service, set them in the dashboard. They are all listed below. Railway's replacement is Infrastructure as Code (`.railway/railway.ts`). It isn't included here because I couldn't verify its Dockerfile-builder options.
+> **Note on `railway.json`.** Railway has deprecated Config as Code. Its docs say *"New services cannot opt into Config as Code"* and existing files stop being read on **2026-12-01**. The included `railway.json` (builder `DOCKERFILE`, restart `ALWAYS`) records the intended settings. For a new service, set them in the dashboard. They are all listed below. Railway's replacement is Infrastructure as Code (`.railway/railway.ts`). It isn't included here because I couldn't verify its Dockerfile-builder options.
 
 **Service settings to confirm in the dashboard (Service → Settings):**
 
@@ -141,7 +143,7 @@ Without the `gh` CLI: create an empty **private** repo on github.com, then run `
 |---|---|
 | Builder | Dockerfile (`Dockerfile` at repo root) |
 | Start command | *(leave empty: the image ENTRYPOINT is used)* |
-| Restart policy | On Failure, max 10 retries |
+| Restart policy | Always. On Failure would leave the service down after a clean exit or after its retry limit runs out |
 | Replicas | **1**. Railway: "Replicas cannot be used with volumes" |
 | Healthcheck path | **leave empty** (see below) |
 | Serverless / app sleeping | Off (sleeping would drop live sessions) |
@@ -158,13 +160,18 @@ Set these in **Service → Variables**:
 | `OPENCODE_SERVER_USERNAME` | no | Defaults to `opencode` |
 | `OPENAI_COMPAT_API_KEY` | no | Separate Bearer key for `/v1`. Defaults to `OPENCODE_SERVER_PASSWORD`. Set it to give API clients a key that can't log in to the web UI |
 | `OPENAI_COMPAT_ENABLED` | no | `true` (default). `false` removes the adapter and OpenCode listens on `$PORT` directly |
-| `OPENAI_COMPAT_AGENT` | no | OpenCode agent for `/v1` requests (e.g. `build`, `plan`). Empty = OpenCode's default |
+| `OPENAI_COMPAT_AGENT` | no | OpenCode agent for `/v1` requests. Default: OpenCode's own default (`build`, with tools), which OpenCode's free models require. `chat` is a built-in agent with no tools (see section 9) |
+| `OPENAI_COMPAT_ALLOW_OVERRIDES` | no | `true` lets callers choose the agent and project folder with the `x-opencode-agent` / `x-opencode-directory` headers. Default: the headers are ignored |
 | `OPENAI_COMPAT_DIRECTORY` | no | Project directory for `/v1` requests. Default `/data/workspace` |
 | `OPENAI_COMPAT_TIMEOUT_SECONDS` | no | Max time per `/v1` request. Default `600` |
 | `OPENAI_COMPAT_KEEP_SESSIONS` | no | `true` keeps each `/v1` request's session visible in the web UI. Default: they're deleted afterwards |
 | `OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS` | no | If OpenCode schedules a provider retry further out than this, or hits the free-tier limit, `/v1` returns `429` right away instead of waiting. Default `30` |
 | `OPENAI_COMPAT_MAX_BODY_MB` | no | Max `/v1` request size, including base64 images. Default `25` |
 | `OPENAI_COMPAT_MAX_IMAGE_MB` | no | Max size of an image the adapter downloads from an `http(s)` URL. Default `10` |
+| `OPENAI_COMPAT_BUFFER_STREAM` | no | `true` sends a streamed answer in one chunk at the end instead of live. Default `false` |
+| `OPENAI_COMPAT_MAX_CONCURRENCY` | no | Max `/v1` chat requests running at once. Others wait up to 10 s, then get `429` with `Retry-After: 5`. Default `4` |
+| `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES` | no | `false` refuses `http(s)` image URLs, so only `data:` URLs are accepted. Default `true` (public addresses only) |
+| `OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST` | no | Comma-separated hostnames that may resolve to private addresses for image downloads. Meant for tests; leave empty |
 | `PORT` | no | Railway injects this automatically. Don't set it unless you use a fixed target port |
 
 Already set in the image (override only if you know why): `HOME=/data/home`, `XDG_*` under `/data/xdg`, `OPENCODE_DISABLE_AUTOUPDATE=true`, `OPENCODE_INTERNAL_PORT=4097`, `OPENCODE_SHUTDOWN_GRACE_SECONDS=8` (implicit default), `OPENCODE_STARTUP_TIMEOUT_SECONDS=180` (implicit default).
@@ -297,21 +304,24 @@ r = client.chat.completions.create(model="anthropic/claude-sonnet-4-5",
 print(r.choices[0].message.content)
 ```
 
-Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1", apiKey: "YOUR_KEY" })`. This was tested with the official `openai` npm SDK v4: model listing, chat, streaming, and a 401 `AuthenticationError` on a bad key.
+Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1", apiKey: "YOUR_KEY" })`. This was tested with the official `openai` npm SDK v4 (model listing, chat, streaming, and a 401 `AuthenticationError` on a bad key) and v5 (live streaming with usage).
 
 **How a request is handled, and what that means for you:**
 
 - Each request creates a new OpenCode session, sends one prompt, returns the final answer text, and then deletes the session. Set `OPENAI_COMPAT_KEEP_SESSIONS=true` to keep sessions so you can inspect them in the web UI. The session ID is returned in the `x-opencode-session` response header.
-- **It's the agent, not a bare model.** OpenCode may read files, run commands and edit code in the project directory before it answers. The response contains only the final text. Pick a different project folder per request with the header `x-opencode-directory: /data/workspace/my-repo`, and a different agent with `x-opencode-agent: plan`.
+- `usage` covers every model call of the run (OpenCode makes one per tool step). Problems on the provider or OpenCode side, including a rejected provider key, return `502` `api_error` with the upstream error name as `code`; `401` always means the `/v1` key was wrong.
+- **It's OpenCode's coding agent, so the `/v1` key can run commands.** By default `/v1` uses OpenCode's default agent, with its tools: the model can read and edit files and run shell commands in the container before it answers. OpenCode's free models require this; they refuse requests that don't come from its coding agent ("Free models work in OpenCode"). Anyone with the `/v1` key can therefore read or change everything under `/data` and use the container's network. They can't read the public password or the API key: those stay in the adapter, OpenCode runs with a separate random internal password, and the adapter process can't be inspected from inside OpenCode (see Security notes).
+- **Tool-free option.** Set `OPENAI_COMPAT_AGENT=chat` for a built-in agent whose permissions deny every tool, so `/v1` only gets model replies and requests stay small. Free models refuse it; use it with a paid provider or OpenCode Go. The adapter adds this agent through `OPENCODE_CONFIG_CONTENT`, which OpenCode merges on top of your `opencode.json`. The `x-opencode-agent` and `x-opencode-directory` request headers are ignored unless you set `OPENAI_COMPAT_ALLOW_OVERRIDES=true`.
 - `system`/`developer` messages become OpenCode's system prompt. Earlier user/assistant turns are flattened into a transcript inside the new prompt, because OpenCode sessions can't be pre-filled with assistant turns.
-- **Streaming is buffered.** With `"stream": true` you get a valid SSE response (role chunk, keep-alive comments every 15 s, then the full answer, then `[DONE]`), but the text arrives in one chunk when OpenCode finishes, not token by token. `stream_options.include_usage` is supported.
+- **Streaming is live.** With `"stream": true` text is forwarded as OpenCode writes it: a role chunk, `content` chunks, a final chunk with `finish_reason`, then `[DONE]`. The model’s reasoning, if any, arrives as `reasoning_content` (clients that don’t know it ignore it). Keep-alive comments fill silences of 15 s or more, so proxies don’t drop the connection. `stream_options.include_usage` is supported. The HTTP 200 is held back until the first text (at most 8 s), so a rate limit hit right away still arrives as a real `429`; after that, errors arrive as an error event inside the stream. If OpenCode uses tools, the stream also carries the text it writes between steps, while a non-streamed reply returns only the final message. Set `OPENAI_COMPAT_BUFFER_STREAM=true` to get the whole answer in one chunk at the end instead.
+- **Browser clients work.** `/v1` answers CORS preflights and allows any origin; the Bearer key is still required on every real request. On ngrok’s free plan, browser requests must also send the header `ngrok-skip-browser-warning: 1`, or ngrok answers with its warning page.
 - **Images and PDFs are supported** in user messages, using standard OpenAI content parts:
-  - `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. A plain `http(s)` URL also works: the adapter downloads it, up to `OPENAI_COMPAT_MAX_IMAGE_MB`.
+  - `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. A plain public `http(s)` URL also works: the adapter downloads it, up to `OPENAI_COMPAT_MAX_IMAGE_MB` (the download is cut off at that size, at most 3 redirects). URLs that resolve to loopback, private, link-local or other internal addresses are refused, and every failed download returns the same `400`, so the API can't be used to probe your network. Set `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES=false` to accept only `data:` URLs.
   - `{"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"x.pdf"}}`. `file_id` isn't supported.
   - Accepted types are PNG, JPEG, GIF, WebP and PDF. Anything else (SVG, audio, `file://` URLs) returns a clear `400`.
   - Use a model that accepts images. Tested free ones that correctly described a test image: `opencode/nemotron-3.5-super-vl-free`, `opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free`, `opencode/deepseek-v4.1-flash-free` and `opencode/inkling-2-small-free`. `opencode/crouton-alpha-free` is listed as image/PDF-capable but answered "not available in your country" from the test location. Text-only models such as `opencode/big-pickle` reply that they can't see images.
 - OpenAI `tools`/function calling is ignored, because OpenCode uses its own tools. Audio input isn't supported. Sampling parameters (`temperature`, `max_tokens`, ...) are ignored.
-- If OpenCode stops to ask for a permission approval, the request waits until `OPENAI_COMPAT_TIMEOUT_SECONDS` and then returns `504`. To avoid that, set permissions in `/data/xdg/config/opencode/opencode.json` (see the [OpenCode permissions docs](https://docs.opencode.ai/docs/config/)).
+- If OpenCode asks for a permission (for example to touch files outside the project folder), the adapter rejects it at once, since nobody can approve it through `/v1`; the model is told and carries on.
 - Only `GET /v1/models` and `POST /v1/chat/completions` exist. Other `/v1/*` paths return an OpenAI-style `404`.
 
 ### Using it from the pi coding agent
@@ -390,8 +400,8 @@ Change `ARG OPENCODE_VERSION` in the `Dockerfile`, run both test suites, then pu
 
 ## Security notes
 
-- The adapter and OpenCode run as uid 10001. Root is used only for the entrypoint's directory setup.
-- OpenCode listens on `127.0.0.1` only. Every public request passes through the adapter, and every route needs credentials: `/v1/*` checks the Bearer key (constant-time compare), and everything else is checked by OpenCode's own Basic auth.
+- The adapter and OpenCode run as uid 10001. Root is used only for the entrypoint's directory setup and for starting OpenCode before the adapter drops to uid 10001.
+- OpenCode listens on `127.0.0.1` only, with a random internal password that only the adapter knows. Every public request passes through the adapter, which checks credentials itself: `/v1/*` the Bearer key, everything else Basic auth with the public password (both constant-time compares), and then swaps in the internal credentials.
 - No credentials are in the image or the repo. The password is never logged (both test suites check this).
 - TLS is terminated by Railway's edge.
-- Anyone with the password **or the `/v1` key** can make OpenCode run shell commands in the container. Treat both like SSH keys: use long random values, give API clients a separate `OPENAI_COMPAT_API_KEY`, and rotate by changing the variable and redeploying.
+- Anyone with the password or the `/v1` key can make OpenCode run shell commands in the container (with `OPENAI_COMPAT_AGENT=chat`, the key can't). Those commands can't read the public password or API key: OpenCode's environment holds only the internal password, and the adapter process becomes non-dumpable when it drops from root, so its `/proc/<pid>/environ` and memory are unreadable from inside OpenCode. That isolation needs the container to start as root (the default); started with `--user`, the adapter logs a warning. Everything else in the container, including `/data` and provider logins in `auth.json`, is reachable. Treat both secrets like SSH keys: use long random values, give API clients a separate `OPENAI_COMPAT_API_KEY`, and rotate by changing the variable and redeploying.

@@ -79,5 +79,6 @@ WORKDIR /data/workspace
 EXPOSE 4096
 
 # The entrypoint starts as root only to fix ownership of the freshly mounted
-# volume (Railway mounts volumes as root), then execs OpenCode as `opencode`.
+# volume (Railway mounts volumes as root), then execs the adapter (which runs
+# OpenCode on 127.0.0.1) as `opencode`, or OpenCode directly if the adapter is off.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

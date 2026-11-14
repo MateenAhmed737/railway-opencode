@@ -2,7 +2,9 @@
 # Entrypoint for the OpenCode Railway container.
 #  1. Refuses to start without OPENCODE_SERVER_PASSWORD.
 #  2. Prepares /data (non-recursive ownership fixes only).
-#  3. Drops to the non-root user and execs `opencode web` on 0.0.0.0:$PORT.
+#  3. Drops to the non-root user and execs the OpenAI adapter on 0.0.0.0:$PORT,
+#     which runs `opencode web` on 127.0.0.1:$OPENCODE_INTERNAL_PORT. With
+#     OPENAI_COMPAT_ENABLED=false it execs `opencode web` on 0.0.0.0:$PORT instead.
 set -Eeuo pipefail
 
 log() { printf '[entrypoint] %s\n' "$*" >&2; }

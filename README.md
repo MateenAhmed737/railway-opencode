@@ -107,13 +107,13 @@ Test suites. Both need Docker. On Windows Git Bash, prefix them with `MSYS_NO_PA
 ./tests/smoke-test.sh
 ```
 
-That runs 18 checks: install, password guard, `$PORT`, `0.0.0.0`, non-root, auth on every endpoint, health, writable dirs, graceful shutdown, and persistence across restarts.
+It checks install, password guard, `$PORT`, `0.0.0.0`, non-root, auth on every endpoint, health, writable dirs, graceful shutdown, and persistence across restarts.
 
 ```bash
 ./tests/adapter-test.sh
 ```
 
-That runs 38 checks: `/v1` auth, models, chat, streaming, images (data URLs, downloaded URLs, multiple images, rejected types), error handling, provider rate limits (fast 429), timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
+It checks `/v1` auth, models, chat, streaming, the tool-free default agent, usage, request errors, the concurrency limit, client disconnects, images (data URLs, downloaded URLs, multiple images, rejected types, refused internal URLs, the download size cap), error handling, provider rate limits (fast 429), timeout, session cleanup, passthrough of the UI, SSE and the websocket terminal, internal-only OpenCode port, and shutdown. It uses a fake model provider, so no API key is needed.
 
 ## 2. GitHub repository setup
 
@@ -166,6 +166,7 @@ Set these in **Service → Variables**:
 | `OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS` | no | If OpenCode schedules a provider retry further out than this, or hits the free-tier limit, `/v1` returns `429` right away instead of waiting. Default `30` |
 | `OPENAI_COMPAT_MAX_BODY_MB` | no | Max `/v1` request size, including base64 images. Default `25` |
 | `OPENAI_COMPAT_MAX_IMAGE_MB` | no | Max size of an image the adapter downloads from an `http(s)` URL. Default `10` |
+| `OPENAI_COMPAT_BUFFER_STREAM` | no | `true` sends a streamed answer in one chunk at the end instead of live. Default `false` |
 | `OPENAI_COMPAT_MAX_CONCURRENCY` | no | Max `/v1` chat requests running at once. Others wait up to 10 s, then get `429` with `Retry-After: 5`. Default `4` |
 | `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES` | no | `false` refuses `http(s)` image URLs, so only `data:` URLs are accepted. Default `true` (public addresses only) |
 | `OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST` | no | Comma-separated hostnames that may resolve to private addresses for image downloads. Meant for tests; leave empty |
@@ -301,15 +302,17 @@ r = client.chat.completions.create(model="anthropic/claude-sonnet-4-5",
 print(r.choices[0].message.content)
 ```
 
-Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1", apiKey: "YOUR_KEY" })`. This was tested with the official `openai` npm SDK v4: model listing, chat, streaming, and a 401 `AuthenticationError` on a bad key.
+Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1", apiKey: "YOUR_KEY" })`. This was tested with the official `openai` npm SDK v4 (model listing, chat, streaming, and a 401 `AuthenticationError` on a bad key) and v5 (live streaming with usage).
 
 **How a request is handled, and what that means for you:**
 
 - Each request creates a new OpenCode session, sends one prompt, returns the final answer text, and then deletes the session. Set `OPENAI_COMPAT_KEEP_SESSIONS=true` to keep sessions so you can inspect them in the web UI. The session ID is returned in the `x-opencode-session` response header.
+- `usage` covers every model call of the run (OpenCode makes one per tool step). Problems on the provider or OpenCode side, including a rejected provider key, return `502` `api_error` with the upstream error name as `code`; `401` always means the `/v1` key was wrong.
 - **Plain chat by default, no tools.** `/v1` uses a built-in `chat` agent whose permissions deny every tool, so the model can't read files or run commands, and the request stays small (no OpenCode system prompt or tool definitions). The adapter adds this agent through `OPENCODE_CONFIG_CONTENT`, which OpenCode merges on top of your `opencode.json`; define your own `chat` agent there to change it.
 - **Using the coding agent through `/v1` is opt-in, and then the key equals shell access.** Set `OPENAI_COMPAT_AGENT=build` (or another tool-using agent) to let `/v1` read files, run commands and edit code in the project directory. Anyone with the `/v1` key can then run any command in the container, including reading `OPENCODE_SERVER_PASSWORD` from its environment, so a separate `OPENAI_COMPAT_API_KEY` no longer protects the web UI. The `x-opencode-agent` and `x-opencode-directory` request headers are ignored unless you set `OPENAI_COMPAT_ALLOW_OVERRIDES=true`.
 - `system`/`developer` messages become OpenCode's system prompt. Earlier user/assistant turns are flattened into a transcript inside the new prompt, because OpenCode sessions can't be pre-filled with assistant turns.
-- **Streaming is buffered.** With `"stream": true` you get a valid SSE response (role chunk, keep-alive comments every 15 s, then the full answer, then `[DONE]`), but the text arrives in one chunk when OpenCode finishes, not token by token. `stream_options.include_usage` is supported.
+- **Streaming is live.** With `"stream": true` text is forwarded as OpenCode writes it: a role chunk, `content` chunks, a final chunk with `finish_reason`, then `[DONE]`. The model’s reasoning, if any, arrives as `reasoning_content` (clients that don’t know it ignore it). Keep-alive comments fill silences of 15 s or more, so proxies don’t drop the connection. `stream_options.include_usage` is supported. The HTTP 200 is held back until the first text (at most 8 s), so a rate limit hit right away still arrives as a real `429`; after that, errors arrive as an error event inside the stream. If OpenCode uses tools, the stream also carries the text it writes between steps, while a non-streamed reply returns only the final message. Set `OPENAI_COMPAT_BUFFER_STREAM=true` to get the whole answer in one chunk at the end instead.
+- **Browser clients work.** `/v1` answers CORS preflights and allows any origin; the Bearer key is still required on every real request. On ngrok’s free plan, browser requests must also send the header `ngrok-skip-browser-warning: 1`, or ngrok answers with its warning page.
 - **Images and PDFs are supported** in user messages, using standard OpenAI content parts:
   - `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. A plain public `http(s)` URL also works: the adapter downloads it, up to `OPENAI_COMPAT_MAX_IMAGE_MB` (the download is cut off at that size, at most 3 redirects). URLs that resolve to loopback, private, link-local or other internal addresses are refused, and every failed download returns the same `400`, so the API can't be used to probe your network. Set `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES=false` to accept only `data:` URLs.
   - `{"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"x.pdf"}}`. `file_id` isn't supported.

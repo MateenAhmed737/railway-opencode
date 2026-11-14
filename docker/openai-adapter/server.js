@@ -56,10 +56,6 @@ if (!PASS) {
   console.error('[adapter] OPENCODE_SERVER_PASSWORD is required');
   process.exit(1);
 }
-if (PORT === UP_PORT) {
-  console.error(`[adapter] PORT and OPENCODE_INTERNAL_PORT are both ${PORT}; they must differ`);
-  process.exit(1);
-}
 
 const log = (...a) => console.error('[adapter]', ...a);
 
@@ -79,7 +75,10 @@ function authorized(req) {
     const raw = Buffer.from(h.slice(6).trim(), 'base64').toString('utf8');
     const i = raw.indexOf(':');
     if (i < 0) return false;
-    return safeEqual(raw.slice(0, i), USER) & safeEqual(raw.slice(i + 1), PASS) ? true : false;
+    // Evaluate both comparisons every time so timing doesn't reveal which part was wrong.
+    const userOk = safeEqual(raw.slice(0, i), USER);
+    const passOk = safeEqual(raw.slice(i + 1), PASS);
+    return userOk && passOk;
   }
   return false;
 }

@@ -63,6 +63,13 @@ SEEN="$(docker exec "$NAME" curl -s "http://${LLM}:9000/requests")"
 expect "model was offered no tools" '[tools:0]' "[$(echo "$SEEN" | grep -o '"tools":[0-9]*' | tr -d '"' | sort -u | tr '\n' ' ' | sed 's/ $//')]"
 expect "no tool output reached the model" 'clean' "$( [[ "$SEEN" == *LEAK:* || "$SEEN" == *"$KEY"* ]] && echo ran || echo clean)"
 
+echo "== usage and upstream errors"
+expect "usage sums every model call of a run" '"total_tokens":36' "$(chat "$TC")"
+R="$(curl -s -m 30 -w ' HTTP%{http_code}' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"fake/echo","messages":[{"role":"user","content":"AUTHFAIL"}]}')"
+expect "provider auth failure -> 502, not 401" 'HTTP502' "$R"
+expect "provider auth failure keeps OpenCode's error code" '"code":"APIError"' "$R"
+expect "unknown model -> 502 api_error" 'HTTP502' "$(curl -s -m 30 -w ' HTTP%{http_code}' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"fake/nope","messages":[{"role":"user","content":"x"}]}')"
+
 echo "== images"
 PNG='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
 expect "data: URL image reaches model" '[img=1]: look' "$(chat "{\"model\":\"fake/echo\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"${PNG}\"}}]}]}")"

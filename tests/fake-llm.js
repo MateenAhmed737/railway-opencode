@@ -22,12 +22,12 @@ function respondToolCall(res, body) {
     const base = { id: 'fake', object: 'chat.completion.chunk', created: 0, model: 'echo' };
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [call] }, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 } })}\n\n`);
     res.write('data: [DONE]\n\n');
     return res.end();
   }
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ id: 'fake', object: 'chat.completion', created: 0, model: 'echo', choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' }] }));
+  res.end(JSON.stringify({ id: 'fake', object: 'chat.completion', created: 0, model: 'echo', choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 } }));
 }
 
 function respond(res, body, reply) {
@@ -98,6 +98,11 @@ http
       if (reply.includes('TOOLCALL')) {
         if (!toolResult) return respondToolCall(res, body);
         return respond(res, body, `${reply} TOOL-OUTPUT: ${text(toolResult)}`);
+      }
+      // "AUTHFAIL" simulates a provider rejecting the server's own API key.
+      if (reply.includes('AUTHFAIL')) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: { message: 'Fake provider: invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } }));
       }
       // "LIMIT" simulates a provider quota: 429 with a one-hour Retry-After.
       if (reply.includes('LIMIT')) {

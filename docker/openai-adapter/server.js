@@ -154,40 +154,64 @@ function oc(method, path, body, signal) {
  * Follow OpenCode's event stream for one session. OpenCode reports provider
  * rate limits as `session.status {type:"retry"}` and keeps waiting (for the
  * free tier, until the quota resets, which can be many hours). Returns a
- * function that stops watching.
+ * function that stops watching. If the stream fails or drops, it is logged and
+ * reopened once; a second loss calls onLost, because without events neither
+ * the fast 429 nor live streaming can work.
  */
-function watchSession(sessionID, dir, onEvent) {
+function watchSession(sessionID, dir, onEvent, onLost) {
   let ready;
   const connected = new Promise((r) => { ready = r; });
   setTimeout(ready, 5000).unref(); // never block a prompt on the watcher for long
-  const req = http.request(
-    { host: '127.0.0.1', port: UP_PORT, method: 'GET', path: withDir('/event', dir), headers: { authorization: UP_AUTH, accept: 'text/event-stream' } },
-    (res) => {
-      ready();
-      res.setEncoding('utf8');
-      let buf = '';
-      res.on('data', (chunk) => {
-        buf += chunk;
-        let i;
-        while ((i = buf.indexOf('\n\n')) >= 0) {
-          const frame = buf.slice(0, i);
-          buf = buf.slice(i + 2);
-          for (const line of frame.split('\n')) {
-            if (!line.startsWith('data:')) continue;
-            try {
-              const ev = JSON.parse(line.slice(5).trim());
-              const p = ev.properties || {};
-              if ((p.sessionID || (p.info && p.info.sessionID) || (p.part && p.part.sessionID)) === sessionID) onEvent(ev);
-            } catch {}
+  let stopped = false;
+  let retried = false;
+  let req;
+  const lost = (why) => {
+    if (stopped) return;
+    if (!retried) {
+      retried = true;
+      log(`event stream for ${sessionID} ${why}; reconnecting`);
+      return connect();
+    }
+    stopped = true;
+    log(`event stream for ${sessionID} ${why} again; giving up`);
+    ready();
+    if (onLost) onLost();
+  };
+  const connect = () => {
+    let gone = false; // report each connection's loss once ('error' and 'end' can both fire)
+    const drop = (why) => { if (!gone) { gone = true; lost(why); } };
+    req = http.request(
+      { host: '127.0.0.1', port: UP_PORT, method: 'GET', path: withDir('/event', dir), headers: { authorization: UP_AUTH, accept: 'text/event-stream' } },
+      (res) => {
+        if (res.statusCode !== 200) { res.resume(); return drop(`returned HTTP ${res.statusCode}`); }
+        ready();
+        res.setEncoding('utf8');
+        let buf = '';
+        res.on('data', (chunk) => {
+          buf += chunk;
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const frame = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            for (const line of frame.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              try {
+                const ev = JSON.parse(line.slice(5).trim());
+                const p = ev.properties || {};
+                if ((p.sessionID || (p.info && p.info.sessionID) || (p.part && p.part.sessionID)) === sessionID) onEvent(ev);
+              } catch {}
+            }
           }
-        }
-      });
-      res.on('error', () => {});
-    },
-  );
-  req.on('error', () => ready());
-  req.end();
-  const stop = () => req.destroy();
+        });
+        res.on('end', () => drop('ended'));
+        res.on('error', () => drop('failed'));
+      },
+    );
+    req.on('error', (e) => drop(`failed (${e.code || e.message})`));
+    req.end();
+  };
+  connect();
+  const stop = () => { stopped = true; req.destroy(); };
   stop.connected = connected;
   return stop;
 }
@@ -565,6 +589,7 @@ async function handleChat(req, res) {
 
   // Fail fast instead of hanging when the provider is rate-limiting us.
   let rateLimited = null;
+  let watcherLost = false;
   const stopWatching = watchSession(sessionID, dir, (ev) => {
     if (live && !rateLimited) forward(ev);
     if (ev.type !== 'session.status' || !ev.properties.status || ev.properties.status.type !== 'retry') return;
@@ -579,7 +604,7 @@ async function handleChat(req, res) {
       reason: (st.action && st.action.reason) || 'retry',
     };
     ac.abort();
-  });
+  }, () => { watcherLost = true; ac.abort(); });
 
   const cleanup = () => {
     clearTimeout(timer);
@@ -616,32 +641,45 @@ async function handleChat(req, res) {
       log(`chat ${sessionID} rate limited: ${rateLimited.reason}, retry in ${rateLimited.retryAfter}s`);
       return fail(429, msg, 'rate_limit_error', rateLimited.reason, { 'retry-after': String(rateLimited.retryAfter) });
     }
-    const msg = timedOut ? `OpenCode did not finish within ${TIMEOUT_MS / 1000}s (it may be waiting for a permission approval)` : `OpenCode request failed: ${e.message}`;
+    const msg = timedOut ? `OpenCode did not finish within ${TIMEOUT_MS / 1000}s (it may be waiting for a permission approval)`
+      : watcherLost ? 'Lost the connection to OpenCode\'s event stream, so the request could not be followed'
+      : `OpenCode request failed: ${e.message}`;
     log(`chat ${sessionID} failed: ${msg}`);
     return fail(timedOut ? 504 : 502, msg, 'api_error');
   }
+
+  // Usage over every assistant message of the run (one per model call when tools are used),
+  // read before the session is deleted.
+  let allTokens = null;
+  if (r.status === 200) {
+    try {
+      const m = await oc('GET', withDir(`/session/${sessionID}/message`, dir), undefined, AbortSignal.timeout(5000));
+      if (m.status === 200 && Array.isArray(m.json)) allTokens = m.json.filter((x) => x.info && x.info.role === 'assistant').map((x) => x.info.tokens || {});
+    } catch {}
+  }
   cleanup();
 
+  // Upstream problems are always 502: a 401/4xx from us would read as "your request or key is wrong".
   const info = r.json && r.json.info;
   if (r.status !== 200 || !info) {
     const msg = (r.json && (r.json.message || (r.json.data && r.json.data.message))) || `OpenCode returned ${r.status}`;
     log(`chat ${sessionID} upstream ${r.status}`);
-    return fail(r.status >= 400 && r.status < 500 ? r.status : 502, msg, 'api_error');
+    return fail(502, msg, 'api_error', `upstream_${r.status}`);
   }
   if (info.error && info.error.name !== 'MessageOutputLengthError') {
     const msg = errorMessage(info.error);
     log(`chat ${sessionID} model error: ${info.error.name}`);
-    return fail(info.error.name === 'ProviderAuthError' ? 401 : 502, msg, 'api_error', info.error.name);
+    return fail(502, msg, 'api_error', info.error.name);
   }
 
   const finalText = (r.json.parts || []).filter((p) => p.type === 'text' && !p.synthetic && !p.ignored && p.text);
   const content = finalText.map((p) => p.text).join('\n\n');
   const finish_reason = info.error && info.error.name === 'MessageOutputLengthError' ? 'length' : 'stop';
-  const t = info.tokens || {};
-  const usage = {
-    prompt_tokens: (t.input || 0) + ((t.cache && t.cache.read) || 0),
-    completion_tokens: (t.output || 0) + (t.reasoning || 0),
-  };
+  const usage = { prompt_tokens: 0, completion_tokens: 0 };
+  for (const t of allTokens && allTokens.length ? allTokens : [info.tokens || {}]) {
+    usage.prompt_tokens += (t.input || 0) + ((t.cache && t.cache.read) || 0);
+    usage.completion_tokens += (t.output || 0) + (t.reasoning || 0);
+  }
   usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
   const modelName = info.providerID && info.modelID ? `${info.providerID}/${info.modelID}` : body.model || 'default';
 

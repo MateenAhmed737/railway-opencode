@@ -524,6 +524,19 @@ const server = http.createServer(async (req, res) => {
   const path = (req.url || '/').split('?')[0];
   if (path !== '/v1' && !path.startsWith('/v1/')) return proxy(req, res);
 
+  // CORS for /v1 so browser clients (e.g. a page opened from disk) can call it.
+  // Bearer auth is still required on every real request; preflights carry no credentials.
+  res.setHeader('access-control-allow-origin', '*');
+  res.setHeader('access-control-expose-headers', 'retry-after');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': req.headers['access-control-request-headers'] || 'authorization, content-type',
+      'access-control-max-age': '600',
+    });
+    return res.end();
+  }
+
   if (!authorized(req)) {
     return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', param: null, code: 'invalid_api_key' } }, { 'www-authenticate': 'Bearer' });
   }

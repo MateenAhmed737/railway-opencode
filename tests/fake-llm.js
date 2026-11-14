@@ -52,6 +52,20 @@ http
         res.writeHead(200, { 'content-type': 'image/png' });
         return res.end(PNG);
       }
+      // 300 MB labelled image/png with no content-length, to test the streamed size cap.
+      if (req.url === '/big.png') {
+        res.writeHead(200, { 'content-type': 'image/png' });
+        const block = Buffer.alloc(1024 * 1024);
+        let sent = 0;
+        const pump = () => { while (sent < 300 && !res.destroyed) { sent++; if (!res.write(block)) return res.once('drain', pump); } res.end(); };
+        res.on('error', () => {});
+        return pump();
+      }
+      // Redirect to OpenCode's internal port inside the adapter container.
+      if (req.url === '/to-loopback.png') {
+        res.writeHead(302, { location: 'http://127.0.0.1:4097/global/health' });
+        return res.end();
+      }
       if (req.url === '/requests') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify(seen));

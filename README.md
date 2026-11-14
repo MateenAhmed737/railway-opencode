@@ -166,6 +166,8 @@ Set these in **Service → Variables**:
 | `OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS` | no | If OpenCode schedules a provider retry further out than this, or hits the free-tier limit, `/v1` returns `429` right away instead of waiting. Default `30` |
 | `OPENAI_COMPAT_MAX_BODY_MB` | no | Max `/v1` request size, including base64 images. Default `25` |
 | `OPENAI_COMPAT_MAX_IMAGE_MB` | no | Max size of an image the adapter downloads from an `http(s)` URL. Default `10` |
+| `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES` | no | `false` refuses `http(s)` image URLs, so only `data:` URLs are accepted. Default `true` (public addresses only) |
+| `OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST` | no | Comma-separated hostnames that may resolve to private addresses for image downloads. Meant for tests; leave empty |
 | `PORT` | no | Railway injects this automatically. Don't set it unless you use a fixed target port |
 
 Already set in the image (override only if you know why): `HOME=/data/home`, `XDG_*` under `/data/xdg`, `OPENCODE_DISABLE_AUTOUPDATE=true`, `OPENCODE_INTERNAL_PORT=4097`, `OPENCODE_SHUTDOWN_GRACE_SECONDS=8` (implicit default), `OPENCODE_STARTUP_TIMEOUT_SECONDS=180` (implicit default).
@@ -308,7 +310,7 @@ Node (`openai` package): `new OpenAI({ baseURL: "https://YOUR-RAILWAY-DOMAIN/v1"
 - `system`/`developer` messages become OpenCode's system prompt. Earlier user/assistant turns are flattened into a transcript inside the new prompt, because OpenCode sessions can't be pre-filled with assistant turns.
 - **Streaming is buffered.** With `"stream": true` you get a valid SSE response (role chunk, keep-alive comments every 15 s, then the full answer, then `[DONE]`), but the text arrives in one chunk when OpenCode finishes, not token by token. `stream_options.include_usage` is supported.
 - **Images and PDFs are supported** in user messages, using standard OpenAI content parts:
-  - `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. A plain `http(s)` URL also works: the adapter downloads it, up to `OPENAI_COMPAT_MAX_IMAGE_MB`.
+  - `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. A plain public `http(s)` URL also works: the adapter downloads it, up to `OPENAI_COMPAT_MAX_IMAGE_MB` (the download is cut off at that size, at most 3 redirects). URLs that resolve to loopback, private, link-local or other internal addresses are refused, and every failed download returns the same `400`, so the API can't be used to probe your network. Set `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES=false` to accept only `data:` URLs.
   - `{"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"x.pdf"}}`. `file_id` isn't supported.
   - Accepted types are PNG, JPEG, GIF, WebP and PDF. Anything else (SVG, audio, `file://` URLs) returns a clear `400`.
   - Use a model that accepts images. Tested free ones that correctly described a test image: `opencode/nemotron-3.5-super-vl-free`, `opencode/glm-5.3-flash-free`, `opencode/mimo-v2.6-flash-free`, `opencode/deepseek-v4.1-flash-free` and `opencode/inkling-2-small-free`. `opencode/crouton-alpha-free` is listed as image/PDF-capable but answered "not available in your country" from the test location. Text-only models such as `opencode/big-pickle` reply that they can't see images.

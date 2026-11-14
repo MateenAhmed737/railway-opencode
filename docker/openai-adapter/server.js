@@ -12,6 +12,8 @@
  * and exits when OpenCode exits. No npm dependencies.
  */
 const http = require('node:http');
+const https = require('node:https');
+const dns = require('node:dns');
 const net = require('node:net');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
@@ -42,6 +44,12 @@ const STREAM_OPEN_DELAY_MS = 8000;
 const MAX_BODY = int(env.OPENAI_COMPAT_MAX_BODY_MB, 25) * 1024 * 1024;
 const MAX_REMOTE_FILE = int(env.OPENAI_COMPAT_MAX_IMAGE_MB, 10) * 1024 * 1024;
 const FILE_MIME = /^(image\/(png|jpe?g|gif|webp)|application\/pdf)$/i;
+// http(s) image URLs are downloaded by the adapter. Hosts that resolve to loopback,
+// private, link-local or other internal addresses are refused, except hostnames listed in
+// OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST (comma-separated; meant for tests on a private Docker network).
+const ALLOW_REMOTE_FILES = !/^(0|false|no)$/i.test(env.OPENAI_COMPAT_ALLOW_REMOTE_IMAGES || '');
+const PRIVATE_HOST_ALLOWLIST = new Set((env.OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean));
+const MAX_REDIRECTS = 3;
 const UP_AUTH = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
 
 if (!PASS) {
@@ -233,20 +241,74 @@ async function resolveFile(f, index, signal) {
     return { type: 'file', mime: d.mime === 'image/jpg' ? 'image/jpeg' : d.mime, url: f.url, filename };
   }
   if (!/^https?:\/\//i.test(f.url)) throw badRequest(`${filename}: url must be a data: URL or http(s) URL`);
-  let r;
+  if (!ALLOW_REMOTE_FILES) throw badRequest(`${filename}: image URLs are disabled on this server; send the image as a base64 data: URL`);
   try {
-    r = await fetch(f.url, { signal, redirect: 'follow' });
+    const { mime, buf } = await download(f.url, signal);
+    return { type: 'file', mime, url: `data:${mime};base64,${buf.toString('base64')}`, filename };
   } catch (e) {
-    throw badRequest(`${filename}: could not download ${f.url} (${e.message})`);
+    if (signal && signal.aborted) throw e;
+    // One message for every failure, so responses don't reveal what is on internal hosts.
+    log(`image download failed: ${e.message}`);
+    throw badRequest(`${filename}: could not download the image URL (it must be a public http(s) URL serving a PNG, JPEG, GIF, WebP or PDF up to ${MAX_REMOTE_FILE >> 20} MB)`);
   }
-  if (!r.ok) throw badRequest(`${filename}: download returned HTTP ${r.status}`);
-  const mime = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-  if (!FILE_MIME.test(mime)) throw badRequest(`${filename}: downloaded content type '${mime}' is not an image or pdf`);
-  const len = Number(r.headers.get('content-length') || 0);
-  if (len > MAX_REMOTE_FILE) throw badRequest(`${filename}: larger than ${MAX_REMOTE_FILE >> 20} MB`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  if (buf.length > MAX_REMOTE_FILE) throw badRequest(`${filename}: larger than ${MAX_REMOTE_FILE >> 20} MB`);
-  return { type: 'file', mime, url: `data:${mime};base64,${buf.toString('base64')}`, filename };
+}
+
+// Addresses a downloaded URL may not resolve to.
+const BLOCKED = new net.BlockList();
+for (const [a, p] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]]) BLOCKED.addSubnet(a, p, 'ipv4');
+for (const [a, p] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96]]) BLOCKED.addSubnet(a, p, 'ipv6');
+function blockedAddress(address, family) {
+  if (family === 6 || family === 'IPv6') {
+    const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address); // IPv4-mapped
+    return m ? BLOCKED.check(m[1], 'ipv4') : BLOCKED.check(address, 'ipv6');
+  }
+  return BLOCKED.check(address, 'ipv4');
+}
+
+// DNS lookup used for the actual connection, so the address that is checked is the one connected to.
+function safeLookup(hostname, options, cb) {
+  dns.lookup(hostname, { ...options, all: true }, (err, addrs) => {
+    if (err) return cb(err);
+    const bad = !PRIVATE_HOST_ALLOWLIST.has(String(hostname).toLowerCase()) && addrs.find((a) => blockedAddress(a.address, a.family));
+    if (bad) return cb(Object.assign(new Error(`${hostname} resolves to blocked address ${bad.address}`), { code: 'EBLOCKED' }));
+    if (options && options.all) return cb(null, addrs);
+    cb(null, addrs[0].address, addrs[0].family);
+  });
+}
+
+/** GET a URL with blocked-address checks on every hop, at most MAX_REDIRECTS redirects, and a streamed size cap. */
+async function download(url, signal, hops = 0) {
+  const u = new URL(url);
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error(`unsupported protocol ${u.protocol}`);
+  // Literal IPs never go through the lookup hook, so check them here.
+  const ip = u.hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(ip) && !PRIVATE_HOST_ALLOWLIST.has(ip) && blockedAddress(ip, net.isIP(ip))) throw new Error(`blocked address ${ip}`);
+  return new Promise((resolve, reject) => {
+    const req = (u.protocol === 'https:' ? https : http).get(u, { lookup: safeLookup, signal, timeout: 30_000, headers: { accept: 'image/*,application/pdf' } }, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        if (hops >= MAX_REDIRECTS) return reject(new Error('too many redirects'));
+        return resolve(download(new URL(res.headers.location, u).href, signal, hops + 1));
+      }
+      if (status !== 200) { res.resume(); return reject(new Error(`HTTP ${status} from ${u.host}`)); }
+      const mime = String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      if (!FILE_MIME.test(mime)) { res.resume(); return reject(new Error(`content type '${mime}' from ${u.host}`)); }
+      if (Number(res.headers['content-length'] || 0) > MAX_REMOTE_FILE) { res.destroy(); return reject(new Error(`content-length over limit from ${u.host}`)); }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_REMOTE_FILE) { res.destroy(); req.destroy(); return reject(new Error(`body over ${MAX_REMOTE_FILE} bytes from ${u.host}`)); }
+        chunks.push(c);
+      });
+      res.on('end', () => resolve({ mime: mime === 'image/jpg' ? 'image/jpeg' : mime, buf: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('download timed out')));
+    req.on('error', reject);
+  });
 }
 
 /** OpenAI messages -> { system, text, files } for a single OpenCode prompt. */

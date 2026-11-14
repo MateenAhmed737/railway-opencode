@@ -27,7 +27,7 @@ docker network create "$NET" >/dev/null
 docker run -d --name "$LLM" --network "$NET" -v "$SRC:/fake-llm.js:ro" --entrypoint node "$IMAGE" /fake-llm.js >/dev/null
 CFG="{\"provider\":{\"fake\":{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"Fake\",\"options\":{\"baseURL\":\"http://${LLM}:9000/v1\",\"apiKey\":\"x\"},\"models\":{\"echo\":{\"name\":\"Echo\",\"attachment\":true,\"modalities\":{\"input\":[\"text\",\"image\"],\"output\":[\"text\"]}}}}},\"model\":\"fake/echo\"}"
 docker run -d --name "$NAME" --network "$NET" -e PORT="$PORT" -e OPENCODE_SERVER_PASSWORD="$KEY" \
-  -e OPENCODE_CONFIG_CONTENT="$CFG" -e OPENAI_COMPAT_TIMEOUT_SECONDS=3 -p "${PORT}:${PORT}" "$IMAGE" >/dev/null
+  -e OPENCODE_CONFIG_CONTENT="$CFG" -e OPENAI_COMPAT_TIMEOUT_SECONDS=3 -e OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST="$LLM" -p "${PORT}:${PORT}" "$IMAGE" >/dev/null
 for _ in $(seq 1 60); do curl -sf -o /dev/null -u "opencode:${KEY}" "${BASE}/global/health" && break; sleep 1; done
 expect "server up" '"healthy":true' "$(curl -s -u "opencode:${KEY}" "${BASE}/global/health")"
 
@@ -71,6 +71,17 @@ expect "two images in one message" '[img=2]' "$(chat "{\"model\":\"fake/echo\",\
 expect "svg rejected -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/svg+xml;base64,PHN2Zy8+"}}]}]}')"
 expect "non-image download -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"http://${LLM}:9000/v1/models\"}}]}]}")"
 expect "file:// url rejected -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///etc/passwd"}}]}]}')"
+img() { curl -s -m 60 -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"$1\"}}]}]}"; }
+GENERIC="$(img 'http://127.0.0.1:4097/global/health')"
+expect "loopback image URL -> 400" 'could not download the image URL' "$GENERIC"
+for u in 'http://localhost:4097/' 'http://169.254.169.254/latest/meta-data/' 'http://10.0.0.1/x.png' 'http://[::1]:4097/' "http://${LLM}:9000/to-loopback.png"; do
+  [[ "$(img "$u")" == "$GENERIC" ]] && pass "same generic 400 for $u" || fail "different reply for $u: $(img "$u" | head -c 200)"
+done
+START=$(date +%s)
+expect "300 MB image cut off -> 400" 'could not download the image URL' "$(img "http://${LLM}:9000/big.png")"
+(( $(date +%s) - START < 20 )) && pass "oversized download aborted in $(( $(date +%s) - START ))s" || fail "oversized download took $(( $(date +%s) - START ))s"
+PEAK="$(docker exec "$NAME" sh -c 'grep VmHWM /proc/$(pgrep -f openai-adapter/server.js | head -1)/status' | awk '{print $2}')"
+(( ${PEAK:-0} > 0 && PEAK < 150 * 1024 )) && pass "adapter peak memory stayed low ($(( PEAK / 1024 )) MB)" || fail "adapter peak memory ${PEAK:-?} kB"
 expect "audio part -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]}')"
 
 echo "== errors"

@@ -12,6 +12,8 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR
 
 // Every chat request is recorded (tool count, agent prompt size) and served at /requests.
 const seen = [];
+// Chat requests currently open, and the most ever open at once (served at /inflight).
+let inflight = 0, maxInflight = 0;
 const BASH = 'echo LEAK:$OPENCODE_SERVER_PASSWORD; echo LEAK:$OPENCODE_SERVER_PASSWORD > /data/workspace/leak.txt';
 
 function respondToolCall(res, body) {
@@ -69,6 +71,10 @@ http
       if (req.url === '/slow.png') {
         return setTimeout(() => { if (!res.destroyed) { res.writeHead(200, { 'content-type': 'image/png' }); res.end(PNG); } }, 3000);
       }
+      if (req.url === '/inflight') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ inflight, max: maxInflight }));
+      }
       if (req.url === '/requests') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify(seen));
@@ -79,6 +85,8 @@ http
       }
       let body = {};
       try { body = JSON.parse(raw || '{}'); } catch {}
+      inflight++; maxInflight = Math.max(maxInflight, inflight);
+      res.on('close', () => { inflight--; });
       const msgs = body.messages || [];
       const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
       const sys = msgs.some((m) => m.role === 'system' && text(m).includes('ADAPTER-SYSTEM-MARKER')) ? 'yes' : 'no';

@@ -93,6 +93,16 @@ sleep 4
 expect "client that left during download never reaches the model" "$BEFORE" "$(nreq)"
 expect "no session left behind" '0' "$(curl -s -u "opencode:${KEY}" "${BASE}/session" | grep -o 'openai-compat' | wc -l | tr -d ' ')"
 
+echo "== concurrency"
+for i in $(seq 1 20); do
+  curl -s -m 40 -o /dev/null -w '%{http_code}%header{retry-after}\n' -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"SLOW $i\"}]}" > "/tmp/oc-conc-$$-$i" &
+done
+wait
+CODES="$(cat /tmp/oc-conc-$$-* | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"; rm -f /tmp/oc-conc-$$-*
+MAXIN="$(docker exec "$NAME" curl -s "http://${LLM}:9000/inflight" | sed -n 's/.*"max":\([0-9]*\).*/\1/p')"
+(( MAXIN >= 1 && MAXIN <= 4 )) && pass "at most 4 requests reached the model at once (max ${MAXIN}; status codes: ${CODES})" || fail "max ${MAXIN} requests reached the model at once (codes: ${CODES})"
+expect "requests queued over 10 s get 429 with Retry-After: 5" ' 4295' "$CODES"
+
 echo "== errors"
 expect "bad model id -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{"model":"echo","messages":[{"role":"user","content":"x"}]}')"
 expect "invalid JSON -> 400" 400 "$(code -H "Authorization: Bearer ${KEY}" -H 'content-type: application/json' "${BASE}/v1/chat/completions" -d '{')"

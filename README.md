@@ -166,6 +166,7 @@ Set these in **Service → Variables**:
 | `OPENAI_COMPAT_MAX_RETRY_WAIT_SECONDS` | no | If OpenCode schedules a provider retry further out than this, or hits the free-tier limit, `/v1` returns `429` right away instead of waiting. Default `30` |
 | `OPENAI_COMPAT_MAX_BODY_MB` | no | Max `/v1` request size, including base64 images. Default `25` |
 | `OPENAI_COMPAT_MAX_IMAGE_MB` | no | Max size of an image the adapter downloads from an `http(s)` URL. Default `10` |
+| `OPENAI_COMPAT_MAX_CONCURRENCY` | no | Max `/v1` chat requests running at once. Others wait up to 10 s, then get `429` with `Retry-After: 5`. Default `4` |
 | `OPENAI_COMPAT_ALLOW_REMOTE_IMAGES` | no | `false` refuses `http(s)` image URLs, so only `data:` URLs are accepted. Default `true` (public addresses only) |
 | `OPENAI_COMPAT_IMAGE_HOST_ALLOWLIST` | no | Comma-separated hostnames that may resolve to private addresses for image downloads. Meant for tests; leave empty |
 | `PORT` | no | Railway injects this automatically. Don't set it unless you use a fixed target port |

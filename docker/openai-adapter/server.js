@@ -377,7 +377,43 @@ async function listModels(req, res) {
   sendJson(res, 200, { object: 'list', data });
 }
 
+// At most MAX_CONCURRENCY chat requests run at once; others wait up to QUEUE_WAIT_MS, then get a 429.
+const MAX_CONCURRENCY = int(env.OPENAI_COMPAT_MAX_CONCURRENCY, 4);
+const QUEUE_WAIT_MS = 10_000;
+let active = 0;
+const waiting = [];
+function acquireSlot(res) {
+  if (active < MAX_CONCURRENCY) { active++; return Promise.resolve(true); }
+  return new Promise((resolve) => {
+    const entry = { grant: () => { clearTimeout(t); res.off('close', onClose); active++; resolve(true); } };
+    const drop = () => { const i = waiting.indexOf(entry); if (i >= 0) waiting.splice(i, 1); };
+    const t = setTimeout(() => { drop(); res.off('close', onClose); resolve(false); }, QUEUE_WAIT_MS);
+    const onClose = () => { clearTimeout(t); drop(); resolve(null); };
+    res.on('close', onClose);
+    waiting.push(entry);
+  });
+}
+function releaseSlot() {
+  active--;
+  const next = waiting.shift();
+  if (next) next.grant();
+}
+
 async function chatCompletions(req, res) {
+  const slot = await acquireSlot(res);
+  if (slot === null) return; // client left while queued
+  if (!slot) {
+    res.setHeader('retry-after', '5');
+    return oaiError(res, 429, `Server busy: ${MAX_CONCURRENCY} requests already running. Retry shortly.`, 'rate_limit_error', 'concurrency_limit');
+  }
+  try {
+    return await handleChat(req, res);
+  } finally {
+    releaseSlot();
+  }
+}
+
+async function handleChat(req, res) {
   // One abort path for the whole request: client disconnect, timeout or rate limit.
   // Registered first, so a client that leaves during body upload, image download or
   // session creation never gets a model run.
